@@ -649,3 +649,8 @@ L1/L2 的沙箱都在 `.dsh/tmp/` 下（已 gitignore），可随时删除重来
 
 验证：本地起 `registry:2`，推入镜像后**删掉所有本地标签**，L1 的 `prepare` 成功从 registry 拉取，
 并用这个拉来的镜像跑完 fetch/build/test 全套（`L1 result: OK`）；L0 51 个用例全过（golden 已刷新）。
+
+**追加（同日）**：推上 GHCR 后 CI 仍报 `403 Forbidden`，但本机匿名 `docker pull` 成功——镜像本
+就是 public，问题在 CI 那次多余登录：`GITHUB_TOKEN` 读不到「本地 PAT 推入用户命名空间」的包，而
+Docker 持有凭据后不会回退匿名。改法：仅当 secret `GHCR_TOKEN` 存在时才登录 ghcr.io，否则显式
+匿名拉取；`docker pull` 失败时按公开/私有两种情况给出提示。

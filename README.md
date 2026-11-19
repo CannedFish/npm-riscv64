@@ -101,8 +101,12 @@ docker push ghcr.io/<owner>/npm-riscv64-toolchain:riscv64
 `docker/riscv64-toolchain.Dockerfile` changes.
 
 CI resolves the image as `vars.RISCV_IMAGE` when set, otherwise
-`ghcr.io/${{ github.repository_owner }}/npm-riscv64-toolchain:riscv64`, logs in to
-GHCR, and pulls it before the build. Locally, L1 works the same way: it uses the
+`ghcr.io/${{ github.repository_owner }}/npm-riscv64-toolchain:riscv64`, and pulls it
+before the build. It only authenticates when a `GHCR_TOKEN` secret is set: a public
+package pulls anonymously, and logging in with the wrong token turns a public image
+into `403 Forbidden` (docker never falls back to anonymous once credentials exist).
+For a private package, either connect the package to the repository or add a token
+with `read:packages` as `GHCR_TOKEN`. Locally, L1 works the same way: it uses the
 local tag if present and pulls `RISCV_IMAGE` when it is missing.
 
 ## Running it in a fork

@@ -82,18 +82,33 @@ jobs:
           echo "RISCV_IMAGE=$image" >> "$GITHUB_ENV"
           echo "toolchain image: $image"
 
-      - name: Log in to the container registry
+      # Only authenticate when a token is actually supplied. Docker never falls
+      # back to anonymous once credentials exist for a registry, and the
+      # GITHUB_TOKEN of a fork cannot read a package that was pushed from a laptop
+      # into the owner's namespace - that combination turns a public image into
+      # "403 Forbidden".
+      - name: Log in to the container registry (only with a token)
         if: startsWith(vars.RISCV_IMAGE || 'ghcr.io/', 'ghcr.io/')
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GHCR_TOKEN:-}" ]; then
+            echo "no GHCR_TOKEN secret set: pulling anonymously (public images work)"
+            exit 0
+          fi
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Pull toolchain image
         run: |
           set -euo pipefail
-          docker pull "$RISCV_IMAGE"
+          if ! docker pull "$RISCV_IMAGE"; then
+            echo "ERROR: cannot pull $RISCV_IMAGE" >&2
+            echo "  public package  -> anonymous pull should work; check the tag exists" >&2
+            echo "  private package -> connect the package to this repository, or add a" >&2
+            echo "                     token with read:packages as the GHCR_TOKEN secret" >&2
+            exit 1
+          fi
           docker image inspect "$RISCV_IMAGE" --format 'image id: {{.Id}}'
 
       # The rendered action goes to a fixed path: every matrix job has its own
