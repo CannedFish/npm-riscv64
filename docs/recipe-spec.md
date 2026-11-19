@@ -248,7 +248,33 @@ Pull requests use a three-dot diff against the merge base, pushes a two-dot diff
 an all-zero `before` (new branch, force push) rebuilds everything. A selected
 version directory without `.stat` fails the run before any build starts.
 
-## 9. Verifying locally
+## 9. Build cache
+
+Rebuilding the same recipe with the same inputs produces the same bytes, so a
+finished workspace tree is cached as an artifact and restored instead of rebuilt.
+
+Key (`scripts/build_key.py`) - every input that can change the artifact:
+
+* the version directory (`.stat`, `commands/`, `patches/`),
+* the package's `common/` layer,
+* `.github/templates/`, `scripts/`, `docker/`,
+* the resolved container image id.
+
+Nothing else can influence the output, so a hit cannot be stale: no diff against the
+source branch is needed, and the same key is produced by a pull request and by the
+merge commit that follows it.
+
+Cache unit is the **tree**, not just the artifact: publish needs the source tree and
+the test needs `node_modules` to resolve the prebuild like a consumer would. `.git` is
+excluded. Artifact name: `<slug>-<ver>-riscv64-tree-<key>` (e.g.
+`ruyisdk-bufferutil-4.2.0-riscv64-tree-77f1d80d3571`), retention 90 days.
+
+On a hit the action receives `reuse: true`, which skips fetch, patch and build. The
+**test step still runs** - a restored artifact is validated like a fresh one - and
+publish runs normally. Any failed lookup (no artifact, expired, API error) falls back
+to a full build.
+
+## 10. Verifying locally
 
 | level | command | what it proves |
 | --- | --- | --- |

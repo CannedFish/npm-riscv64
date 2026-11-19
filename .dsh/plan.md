@@ -267,6 +267,11 @@ npm_publish:
 
 ### 5.1 artifact 复用的定位链（D16）
 
+> **实现变更（2026-11-19）**：实际落地的不是下面这条「合并提交 → PR head → run」定位链，
+> 而是**内容寻址**：构建产物只由「配方 + common 层 + 模板 + 渲染器 + 工具链 + 镜像 ID」决定，
+> 把这几项哈希成 key 并写进 artifact 名，命中即等价、无需 diff 校验，也顺带覆盖直推 main 与
+> 重跑同一 commit 的情况。详见 §13.9。下面保留原始设计以备对照。
+
 ```
 merge_sha = github.sha
   → gh api repos/{owner}/{repo}/commits/{merge_sha}/pulls  → 已合并 PR 的 head SHA
@@ -675,3 +680,29 @@ Docker 持有凭据后不会回退匿名。改法：仅当 secret `GHCR_TOKEN` �
 | 同上再跑发布（verdaccio） | `[publish] wrote src/package.json (generate)` → `+ @ruyisdk/bufferutil@4.2.0` |
 
 默认（uid 0）路径同时回归通过，L0 51 个用例与 golden 已刷新。
+
+### 13.9 artifact 复用落地（S4 收尾，2026-11-19）
+
+L3 全线跑通后按约定补上 D16 的缺口。原设计的定位链（合并提交 → PR head → run → download →
+`git diff` 校验过期）换成**内容寻址**，理由：
+
+| 原设计 | 落地做法 | 为什么更好 |
+|---|---|---|
+| 用 `commits/{sha}/pulls` 找 PR head，再按 commit 找 run | `scripts/build_key.py` 对「配方 + common + 模板 + scripts + docker + 镜像 ID」求哈希，key 写进 artifact 名 | 命中即证明输入相同，不需要再 `git diff` 判过期；直推 main、重跑同一 commit 同样能命中；少两次 API 往返与一类竞态（两个 PR 先后合入） |
+| 缓存对象 = 构建产物（`.node`） | 缓存对象 = **整棵 `src/` 树**（排除 `.git`） | 发布需要源码树、测试需要 `node_modules`（否则 prebuild 解析路径与消费者行为不一致），只缓存 `.node` 反而跑不下去 |
+| main 侧复用 | PR 与 main 都复用 | 同一个 key 命中即同一份输入；PR 反复推同一个配方不再重建 |
+
+实现：`scripts/build_key.py`（含 18 个 L0 用例：稳定/敏感两个方向、common 层、模板、渲染器、
+Dockerfile、镜像 ID、无关配方不失效、`.pyc` 忽略）；模板新增 `reuse` 输入，`fetch`/`patch`/
+`build` 三步加 `if: inputs.reuse != 'true'`，**`test` 始终执行**、`publish` 语义不变；工作流新增
+「算 key → 尝试恢复（`continue-on-error`，查不到就回退重建）→ 用后打包上传」三步，权限补
+`actions: read`。
+
+验证（本地，用 `.dsh/tmp/cache-a` 真构建后打包、再恢复到 `cache-b` 跑）：
+
+| 检查 | 结果 |
+|---|---|
+| 打包体积 / 条目 | 4.1 MB / 2382 条（`--exclude=.git`） |
+| 恢复后带 `reuse` 跑 | `fetch`、`build` 均 `skipped by if-condition`；`test` 执行并通过（`round-tripped 23 bytes`） |
+| 恢复后 `--publish`（verdaccio） | `[publish] wrote src/package.json (generate)` → `+ @ruyisdk/bufferutil@4.2.0` |
+| 解包属主 | 加 `--no-same-owner`，树归属 runner 而非打包者 |
