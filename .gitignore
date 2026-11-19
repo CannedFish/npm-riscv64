@@ -11,3 +11,7 @@ __pycache__/
 
 # Node
 node_modules/
+
+# editor swap files
+*.swp
+*.swo
