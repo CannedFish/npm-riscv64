@@ -64,10 +64,37 @@ jobs:
         with:
           platforms: riscv64
 
-      - name: Build riscv64 toolchain image
+      # The toolchain image is built once by toolchain-image.yml and pulled here:
+      # building it in every matrix job costs minutes of emulated apt installs and
+      # can silently produce nothing (buildx keeps the result in its cache unless
+      # the build is pushed or loaded).
+      - name: Resolve toolchain image
+        env:
+          IMAGE_OVERRIDE: ${{ vars.RISCV_IMAGE }}
         run: |
           set -euo pipefail
-          docker build -f docker/riscv64-toolchain.Dockerfile -t npm-riscv64/toolchain:riscv64 .
+          if [ -n "${IMAGE_OVERRIDE:-}" ]; then
+            image="$IMAGE_OVERRIDE"
+          else
+            # GHCR rejects uppercase repository names, so lowercase the owner.
+            image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/npm-riscv64-toolchain:riscv64"
+          fi
+          echo "RISCV_IMAGE=$image" >> "$GITHUB_ENV"
+          echo "toolchain image: $image"
+
+      - name: Log in to the container registry
+        if: startsWith(vars.RISCV_IMAGE || 'ghcr.io/', 'ghcr.io/')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull toolchain image
+        run: |
+          set -euo pipefail
+          docker pull "$RISCV_IMAGE"
+          docker image inspect "$RISCV_IMAGE" --format 'image id: {{.Id}}'
 
       # The rendered action goes to a fixed path: every matrix job has its own
       # workspace, and `uses:` does not accept expressions.
@@ -104,7 +131,6 @@ jobs:
           # input says so.
           publish: ${{ needs.detect.outputs.publish == 'true' && vars.SKIP_PUBLISH != 'true' }}
         env:
-          RISCV_IMAGE: npm-riscv64/toolchain:riscv64
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Artifacts are kept so the post-merge run can reuse them instead of

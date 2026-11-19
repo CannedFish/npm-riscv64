@@ -1,0 +1,69 @@
+name: build riscv64 toolchain image
+
+# The toolchain image is built once and pulled by build.yml. Building it inside
+# every matrix job means paying ~10 minutes of emulated apt installs per recipe,
+# and it also hides failures: `docker build` can exit 0 while leaving the image
+# only in the buildx cache, which makes the next `docker run` fail with a
+# confusing "Unable to find image locally".
+#
+# Run it manually after changing docker/riscv64-toolchain.Dockerfile, or build and
+# push the same tag from a local docker (see README, "Container image").
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Extra tag for the image (default: the moving riscv64 tag)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: build and push ghcr.io toolchain image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare riscv64 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        env:
+          EXTRA_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # GHCR rejects uppercase repository names, so lowercase the owner.
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/npm-riscv64-toolchain"
+          tags=(
+            --tag "$image:riscv64"
+            --tag "$image:sha-${GITHUB_SHA:0:12}"
+          )
+          if [ -n "${EXTRA_TAG:-}" ]; then
+            tags+=(--tag "$image:$EXTRA_TAG")
+          fi
+          echo "pushing:"
+          printf '  %s\n' "${tags[@]}"
+          # --push is what makes the result leave the build cache. Without it the
+          # step can succeed while publishing nothing, and the next `docker run`
+          # fails with "Unable to find image locally".
+          docker buildx build \
+            --platform linux/riscv64 \
+            --file docker/riscv64-toolchain.Dockerfile \
+            "${tags[@]}" \
+            --push .

@@ -22,6 +22,16 @@ runs:
         set -euo pipefail
         image="${RISCV_IMAGE:-npm-riscv64/toolchain:riscv64}"
         echo "riscv image: $image"
+        if ! docker image inspect "$image" >/dev/null 2>&1; then
+          echo "image not present locally, pulling $image"
+          if ! docker pull "$image"; then
+            echo "ERROR: cannot pull $image" >&2
+            echo "Set RISCV_IMAGE to a reachable image (see the toolchain-image workflow)," >&2
+            echo "or build it locally:" >&2
+            echo "  docker build -f docker/riscv64-toolchain.Dockerfile -t npm-riscv64/toolchain:riscv64 ." >&2
+            exit 1
+          fi
+        fi
         docker run --rm --platform linux/riscv64 "$image" uname -m
 
     # 1/5 - fetch: upstream > source > npm, falling through only on failure.
