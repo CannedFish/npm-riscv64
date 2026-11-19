@@ -631,3 +631,21 @@ python3 tests/l2_publish.py                                               # L2
 ```
 
 L1/L2 的沙箱都在 `.dsh/tmp/` 下（已 gitignore），可随时删除重来。
+
+### 13.7 L3 首跑修正（2026-11-19）
+
+首跑在 `prepare riscv64 emulation` 失败：`docker build` 返回 0 却没留下镜像——buildx 在显式
+`--platform` 且无 `--load`/`--push` 时把结果留在构建缓存里，下一步 `docker run` 找不到镜像，
+转去 Docker Hub 拉一个不存在的仓库名，报出 "pull access denied" 这种误导性错误。
+
+改法（不再每次现建）：
+
+| 改动 | 内容 |
+|---|---|
+| 新增 `toolchain-image` 工作流（`workflow_dispatch`） | `buildx build --platform linux/riscv64 --push` 推到 `ghcr.io/<小写 owner>/npm-riscv64-toolchain`，打 `:riscv64` 与 `:sha-<12>` 两个标签 |
+| `build.yml` | 现建镜像步骤删除，改为「解析镜像名（`vars.RISCV_IMAGE` 优先）→ 登录 GHCR → `docker pull` → `docker image inspect` 回读」 |
+| action 模板 `prepare` | 本地没有就拉，拉不到则给出「设 RISCV_IMAGE 或本地构建」的可执行提示再退出 |
+| 文档 | README 新增 "Container image"，recipe-spec §9 说明镜像来源与 `RISCV_IMAGE` |
+
+验证：本地起 `registry:2`，推入镜像后**删掉所有本地标签**，L1 的 `prepare` 成功从 registry 拉取，
+并用这个拉来的镜像跑完 fetch/build/test 全套（`L1 result: OK`）；L0 51 个用例全过（golden 已刷新）。

@@ -237,9 +237,11 @@ version directory without `.stat` fails the run before any build starts.
 | L1 | `python3 tests/run_action_locally.py --pkg @ruyisdk/bufferutil --ver 4.2.0` | the rendered action really fetches, builds and tests under riscv64 emulation |
 | L2 | `python3 tests/l2_publish.py` | publish order, idempotency, manifest merge, identity, partial-failure re-entry against verdaccio |
 
-L1 and L2 need docker; L1 needs the toolchain image
-(`docker build -f docker/riscv64-toolchain.Dockerfile -t npm-riscv64/toolchain:riscv64 .`).
-Set `RISCV_IMAGE` to override the image and `NPM_REGISTRY` to point publishing at a
-local registry. L3 (real GitHub Actions) runs in a fork; there GitHub Packages
+L1 and L2 need docker. L1 uses the riscv64 toolchain image: it takes a local image
+when one exists and otherwise pulls `RISCV_IMAGE`. In CI the image is published once
+by the `toolchain-image` workflow and pulled per run - building it per run costs
+minutes of emulated package installs and can silently succeed without producing a
+local image. Set `RISCV_IMAGE` to override the image and `NPM_REGISTRY` to point
+publishing at a local registry. L3 (real GitHub Actions) runs in a fork; there GitHub Packages
 requires the npm scope to match the repository owner, which `--override` covers
 without touching the recipes.

@@ -79,6 +79,32 @@ L1 and L2 need docker. For L1, build the toolchain image once:
 docker build -f docker/riscv64-toolchain.Dockerfile -t npm-riscv64/toolchain:riscv64 .
 ```
 
+## Container image
+
+Build and test run inside a riscv64 image. It is **not** built on every run: build it
+once, publish it, and let CI pull it.
+
+```bash
+# local build (needs qemu binfmt, or docker buildx with --platform)
+docker build --platform linux/riscv64 \
+  -f docker/riscv64-toolchain.Dockerfile \
+  -t ghcr.io/<owner>/npm-riscv64-toolchain:riscv64 .
+
+# publish it (needs a token with write:packages)
+echo "$GH_TOKEN" | docker login ghcr.io -u <owner> --password-stdin
+docker push ghcr.io/<owner>/npm-riscv64-toolchain:riscv64
+```
+
+`ghcr.io/<owner>/...` must be lowercase, so `CannedFish` becomes `cannedfish`. The
+`build riscv64 toolchain image` workflow does the same on a runner
+(`Actions -> build riscv64 toolchain image -> Run workflow`); run it again whenever
+`docker/riscv64-toolchain.Dockerfile` changes.
+
+CI resolves the image as `vars.RISCV_IMAGE` when set, otherwise
+`ghcr.io/${{ github.repository_owner }}/npm-riscv64-toolchain:riscv64`, logs in to
+GHCR, and pulls it before the build. Locally, L1 works the same way: it uses the
+local tag if present and pulls `RISCV_IMAGE` when it is missing.
+
 ## Running it in a fork
 
 Publishing to GitHub Packages requires the npm scope to equal the repository owner,
