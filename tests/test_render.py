@@ -15,6 +15,8 @@ import textwrap
 import unittest
 from pathlib import Path
 
+import yaml
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
@@ -173,6 +175,24 @@ class RecipeTests(unittest.TestCase):
             overrides or {},
             **extra,
         )
+
+    def test_reuse_guard_skips_fetch_patch_and_build_only(self):
+        # A cached tree means the workspace already holds the source and artifact,
+        # so exactly the three producing steps are guarded; test must still run
+        # against a restored artifact (D16).
+        self.repo.add_recipe("demo", "1.0.0", patches={"fix.patch": "diff\n"})
+        rendered, _ = self.render("demo", "1.0.0")
+        action = yaml.safe_load(rendered)
+        steps = {step.get("name"): step for step in action["runs"]["steps"]}
+        for name in ("fetch upstream source", "apply patches", "build"):
+            self.assertEqual(
+                steps[name].get("if"),
+                "inputs.reuse != 'true'",
+                f"{name} must be skipped when the tree came from the cache",
+            )
+        self.assertNotIn("if", steps["test"])
+        self.assertEqual(steps["publish"].get("if"), "inputs.publish == 'true'")
+        self.assertEqual(action["inputs"]["reuse"].get("default"), "false")
 
     def test_scoped_slug_and_artifact_name(self):
         self.repo.add_recipe("@demo/pkg", "1.2.3")

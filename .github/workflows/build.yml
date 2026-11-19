@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: read
+  actions: read    # find and download a previous build tree (artifact reuse)
   packages: write # required to publish to GitHub Packages (npm.pkg.github.com)
 
 concurrency:
@@ -111,6 +112,47 @@ jobs:
           fi
           docker image inspect "$RISCV_IMAGE" --format 'image id: {{.Id}}'
 
+      # Artifact reuse (D16). The key covers every input that can change the built
+      # artifact - recipe, common layer, template, renderer, toolchain, image - so a
+      # hit cannot be stale by construction. The plan originally described locating
+      # the merge's pull request run; content addressing is stricter and also covers
+      # direct pushes and re-runs, so it replaces that lookup chain.
+      - name: Compute build key
+        id: cache
+        run: |
+          set -euo pipefail
+          key=$(python3 scripts/build_key.py \
+            --pkg "${{ matrix.target.pkg }}" \
+            --ver "${{ matrix.target.ver }}" \
+            --image-id "$(docker image inspect "$RISCV_IMAGE" --format '{{.Id}}')")
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+          echo "name=${{ matrix.target.artifact }}-tree-$key" >> "$GITHUB_OUTPUT"
+          echo "build key: $key (artifact ${{ matrix.target.artifact }}-tree-$key)"
+
+      # Never fails the job: no cache is always a valid answer.
+      - name: Restore cached build tree
+        id: reuse
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT: ${{ steps.cache.outputs.name }}
+        run: |
+          set -euo pipefail
+          run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$ARTIFACT&per_page=100" \
+            --jq '.artifacts[] | select(.expired == false) | .workflow_run.id' | head -1)
+          if [ -z "$run_id" ]; then
+            echo "miss: nothing cached as $ARTIFACT"
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh run download "$run_id" -n "$ARTIFACT" -D .cache
+          tarball=$(find .cache -name '*.tar.gz' | head -1)
+          mkdir -p src
+          # --no-same-owner: the tree must belong to the runner, whoever packed it.
+          tar xzf "$tarball" -C src --no-same-owner
+          echo "hit=true" >> "$GITHUB_OUTPUT"
+          echo "hit: restored $ARTIFACT from run $run_id ($(du -sh src | cut -f1))"
+
       # The rendered action goes to a fixed path: every matrix job has its own
       # workspace, and `uses:` does not accept expressions.
       #
@@ -145,15 +187,33 @@ jobs:
           # repository variable can veto it, and the action only publishes when the
           # input says so.
           publish: ${{ needs.detect.outputs.publish == 'true' && vars.SKIP_PUBLISH != 'true' }}
+          reuse: ${{ steps.reuse.outputs.hit == 'true' }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Artifacts are kept so the post-merge run can reuse them instead of
-      # paying for a second emulated build (D16; wiring lands with S4).
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target.artifact }}
           path: src/${{ matrix.target.artifact_glob }}
+          if-no-files-found: error
+          retention-days: 90
+
+      # The tree is the cache unit, not just the artifact: publish needs the source
+      # tree as well, and the test step needs node_modules to resolve the prebuild
+      # the way a consumer would. .git is the only thing left out.
+      - name: Pack build tree
+        if: steps.reuse.outputs.hit != 'true'
+        run: |
+          set -euo pipefail
+          tar czf "${{ steps.cache.outputs.name }}.tar.gz" -C src --exclude=.git .
+          ls -lh "${{ steps.cache.outputs.name }}.tar.gz"
+
+      - name: Upload build tree
+        if: steps.reuse.outputs.hit != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.cache.outputs.name }}
+          path: ${{ steps.cache.outputs.name }}.tar.gz
           if-no-files-found: error
           retention-days: 90
