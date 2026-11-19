@@ -6,6 +6,11 @@ description: "Generated from {{recipe.dir}} by scripts/render.py - do not edit b
 # The riscv64 container is pinned here on purpose: changing this template changes
 # every recipe, and a template change forces a full rebuild (see .dsh/plan.md D7).
 # Override the image at run time with the RISCV_IMAGE environment variable.
+#
+# Containers run as the calling user (RISCV_DOCKER_USER overrides it) and get a
+# workspace HOME. Running as root would leave root-owned files in the workspace,
+# and the publish step - which runs on the host, without emulation - could not
+# write the manifest it has to generate.
 
 inputs:
   publish:
@@ -32,6 +37,7 @@ runs:
             exit 1
           fi
         fi
+        mkdir -p "$GITHUB_WORKSPACE/.container-home"
         docker run --rm --platform linux/riscv64 "$image" uname -m
 
     # 1/5 - fetch: upstream > source > npm, falling through only on failure.
@@ -41,6 +47,8 @@ runs:
         set -euo pipefail
         image="${RISCV_IMAGE:-npm-riscv64/toolchain:riscv64}"
         docker run --rm --platform linux/riscv64 \
+          --user "${RISCV_DOCKER_USER:-$(id -u):$(id -g)}" \
+          -e HOME=/w/.container-home -e npm_config_cache=/w/.container-home/.npm \
           -v "$GITHUB_WORKSPACE:/w" -w /w \
           -e SRC_DIR={{src.dir}} -e TMP_DIR=.fetch-tmp \
           "$image" bash "/w/{{steps.dir}}/steps/fetch.sh"
@@ -53,6 +61,8 @@ runs:
         set -euo pipefail
         image="${RISCV_IMAGE:-npm-riscv64/toolchain:riscv64}"
         docker run --rm --platform linux/riscv64 \
+          --user "${RISCV_DOCKER_USER:-$(id -u):$(id -g)}" \
+          -e HOME=/w/.container-home -e npm_config_cache=/w/.container-home/.npm \
           -v "$GITHUB_WORKSPACE:/w" -w /w \
           -e SRC_DIR={{src.dir}} \
           "$image" bash "/w/{{steps.dir}}/steps/patch.sh"
@@ -65,6 +75,8 @@ runs:
         set -euo pipefail
         image="${RISCV_IMAGE:-npm-riscv64/toolchain:riscv64}"
         docker run --rm --platform linux/riscv64 \
+          --user "${RISCV_DOCKER_USER:-$(id -u):$(id -g)}" \
+          -e HOME=/w/.container-home -e npm_config_cache=/w/.container-home/.npm \
           -v "$GITHUB_WORKSPACE:/w" -w "/w/{{src.dir}}/{{upstream.subdir}}" \
           -e SRC_DIR={{src.dir}} \
           "$image" bash "/w/{{steps.dir}}/steps/build.sh"
@@ -76,6 +88,8 @@ runs:
         set -euo pipefail
         image="${RISCV_IMAGE:-npm-riscv64/toolchain:riscv64}"
         docker run --rm --platform linux/riscv64 \
+          --user "${RISCV_DOCKER_USER:-$(id -u):$(id -g)}" \
+          -e HOME=/w/.container-home -e npm_config_cache=/w/.container-home/.npm \
           -v "$GITHUB_WORKSPACE:/w" -w "/w/{{src.dir}}/{{upstream.subdir}}" \
           -e SRC_DIR={{src.dir}} \
           "$image" bash "/w/{{steps.dir}}/steps/test.sh"
