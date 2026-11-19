@@ -1,0 +1,24 @@
+# Metadata for @ruyisdk/bufferutil 4.2.0 (see docs/recipe-spec.md).
+#
+# bufferutil ships a single package that carries per-platform prebuilds
+# (prebuilds/<platform>-<arch>/bufferutil.node, loaded by node-gyp-build), so
+# there is no separate native binding package here: one publish target is
+# enough. The addon is built from source and staged as a prebuild.
+
+upstream:
+  repo: https://github.com/websockets/bufferutil
+  ref: v4.2.0
+
+artifacts:
+  path: prebuilds/linux-riscv64/*.node
+
+npm_publish:
+  - role: main
+    name: "@ruyisdk/bufferutil"
+    version: 4.2.0
+    dir: .
+    registry: https://npm.pkg.github.com
+    token_env: NODE_AUTH_TOKEN
+    # The upstream manifest says "bufferutil"; republishing under our scope is
+    # a deliberate re-brand, so the renderer writes name/version from here.
+    generate_manifest: true
