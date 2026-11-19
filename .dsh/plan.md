@@ -654,3 +654,24 @@ L1/L2 的沙箱都在 `.dsh/tmp/` 下（已 gitignore），可随时删除重来
 就是 public，问题在 CI 那次多余登录：`GITHUB_TOKEN` 读不到「本地 PAT 推入用户命名空间」的包，而
 Docker 持有凭据后不会回退匿名。改法：仅当 secret `GHCR_TOKEN` 存在时才登录 ghcr.io，否则显式
 匿名拉取；`docker pull` 失败时按公开/私有两种情况给出提示。
+
+### 13.8 L3 首跑第二处修正：发布步骤 EACCES（2026-11-19）
+
+`publish` 阶段报 `EACCES: permission denied, open 'src/package.json'`。
+
+原因：容器以 root 运行，`src/**` 全是 root 所有；而 GitHub runner 上的步骤以 `runner`
+（非 root）执行，发布阶段那道「生成 manifest」的写操作就落到别人家的文件上。
+
+改法：所有写工作区的容器步骤统一加 `--user "${RISCV_DOCKER_USER:-$(id -u):$(id -g)}"`
+并把 `HOME`、`npm_config_cache` 指到工作区内（容器用户没有可写的家目录）。于工作区产物
+属主 = 调用者，宿主机上的发布步骤天然可写。
+
+本机复现与验证（沙箱里无法切换 uid，于是用 `RISCV_DOCKER_USER` 反过来模拟 runner）：
+
+| 场景 | 结果 |
+|---|---|
+| 容器 root 建 `src/`（旧行为，属主 0）+ 以 uid 1001 发布 | `EACCES: permission denied, open 'src/package.json'` —— 与 runner 报错一致 |
+| 容器以 uid 1001 建 `src/`（新行为）+ 以 uid 1001 跑完整 L1 | fetch/build/test 全绿，`src/package.json`、`bufferutil.node`、`node_modules` 属主均为 1001 |
+| 同上再跑发布（verdaccio） | `[publish] wrote src/package.json (generate)` → `+ @ruyisdk/bufferutil@4.2.0` |
+
+默认（uid 0）路径同时回归通过，L0 51 个用例与 golden 已刷新。
