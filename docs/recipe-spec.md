@@ -200,6 +200,25 @@ The rendered action is validated before it is written: YAML must parse,
 `runs.using` must be `composite`, every step must have `shell` and a non-empty
 `run`, and the fetch/build/test/publish steps must all be present.
 
+### Container user
+
+Every step that touches the workspace runs its container as **the calling user**:
+
+```bash
+docker run --rm --platform linux/riscv64 \
+  --user "${RISCV_DOCKER_USER:-$(id -u):$(id -g)}" \
+  -e HOME=/w/.container-home -e npm_config_cache=/w/.container-home/.npm \
+  ... -v "$GITHUB_WORKSPACE:/w" ...
+```
+
+Running as root leaves root-owned files in the workspace, and the publish step - which
+runs on the host, outside emulation - then has to write a manifest it does not own. On
+a GitHub runner the step user is `runner`, so the mismatch surfaced as
+`EACCES: permission denied, open 'src/package.json'`.
+
+HOME and the npm cache point inside the workspace because the container user has no
+writable home of its own. `RISCV_DOCKER_USER` overrides the mapping.
+
 ### Quoting
 
 `@` is a YAML reserved indicator character. Any template scalar that *starts*
