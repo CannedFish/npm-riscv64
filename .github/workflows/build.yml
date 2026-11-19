@@ -1,0 +1,159 @@
+name: build riscv64 packages
+
+# One workflow file, two triggers (see .dsh/plan.md D5/D17):
+#   * pull_request -> fetch, patch, build, test
+#   * push to main -> the same, plus publish
+# Publishing never happens for pull requests: the merge is the approval gate.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write # required to publish to GitHub Packages (npm.pkg.github.com)
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  detect:
+    name: detect changed recipes
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.detect.outputs.targets }}
+      has_targets: ${{ steps.detect.outputs.has_targets }}
+      self_check: ${{ steps.detect.outputs.self_check }}
+      publish: ${{ steps.detect.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed recipes
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref || 'main' }}
+          HEAD_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: python3 scripts/detect_targets.py
+
+      - name: Render self-check
+        if: steps.detect.outputs.self_check == 'true'
+        run: python3 scripts/render.py --check-all
+
+  build:
+    name: build (${{ matrix.target.slug }})
+    needs: detect
+    if: needs.detect.outputs.has_targets == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        target: ${{ fromJSON(needs.detect.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare riscv64 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
+
+      # The toolchain image is built once by toolchain-image.yml and pulled here:
+      # building it in every matrix job costs minutes of emulated apt installs and
+      # can silently produce nothing (buildx keeps the result in its cache unless
+      # the build is pushed or loaded).
+      - name: Resolve toolchain image
+        env:
+          IMAGE_OVERRIDE: ${{ vars.RISCV_IMAGE }}
+        run: |
+          set -euo pipefail
+          if [ -n "${IMAGE_OVERRIDE:-}" ]; then
+            image="$IMAGE_OVERRIDE"
+          else
+            # GHCR rejects uppercase repository names, so lowercase the owner.
+            image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/npm-riscv64-toolchain:riscv64"
+          fi
+          echo "RISCV_IMAGE=$image" >> "$GITHUB_ENV"
+          echo "toolchain image: $image"
+
+      # Only authenticate when a token is actually supplied. Docker never falls
+      # back to anonymous once credentials exist for a registry, and the
+      # GITHUB_TOKEN of a fork cannot read a package that was pushed from a laptop
+      # into the owner's namespace - that combination turns a public image into
+      # "403 Forbidden".
+      - name: Log in to the container registry (only with a token)
+        if: startsWith(vars.RISCV_IMAGE || 'ghcr.io/', 'ghcr.io/')
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GHCR_TOKEN:-}" ]; then
+            echo "no GHCR_TOKEN secret set: pulling anonymously (public images work)"
+            exit 0
+          fi
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Pull toolchain image
+        run: |
+          set -euo pipefail
+          if ! docker pull "$RISCV_IMAGE"; then
+            echo "ERROR: cannot pull $RISCV_IMAGE" >&2
+            echo "  public package  -> anonymous pull should work; check the tag exists" >&2
+            echo "  private package -> connect the package to this repository, or add a" >&2
+            echo "                     token with read:packages as the GHCR_TOKEN secret" >&2
+            exit 1
+          fi
+          docker image inspect "$RISCV_IMAGE" --format 'image id: {{.Id}}'
+
+      # The rendered action goes to a fixed path: every matrix job has its own
+      # workspace, and `uses:` does not accept expressions.
+      #
+      # PUBLISH_SCOPE / PUBLISH_REGISTRY are optional repository variables. A fork
+      # needs them because GitHub Packages only accepts packages whose npm scope
+      # equals the repository owner; the recipes themselves stay unchanged.
+      - name: Render composite action
+        env:
+          PUBLISH_SCOPE: ${{ vars.PUBLISH_SCOPE }}
+          PUBLISH_REGISTRY: ${{ vars.PUBLISH_REGISTRY }}
+        run: |
+          set -euo pipefail
+          args=(
+            --pkg "${{ matrix.target.pkg }}"
+            --ver "${{ matrix.target.ver }}"
+            --out-dir .rendered/action
+          )
+          if [ -n "${PUBLISH_SCOPE:-}" ]; then
+            echo "rewriting publish scope to @$PUBLISH_SCOPE"
+            args+=(--publish-scope "$PUBLISH_SCOPE")
+          fi
+          if [ -n "${PUBLISH_REGISTRY:-}" ]; then
+            echo "rewriting publish registry to $PUBLISH_REGISTRY"
+            args+=(--publish-registry "$PUBLISH_REGISTRY")
+          fi
+          python3 scripts/render.py "${args[@]}"
+
+      - name: Run composite action
+        uses: ./.rendered/action
+        with:
+          # Publishing is gated three times: the workflow decides (main only), the
+          # repository variable can veto it, and the action only publishes when the
+          # input says so.
+          publish: ${{ needs.detect.outputs.publish == 'true' && vars.SKIP_PUBLISH != 'true' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Artifacts are kept so the post-merge run can reuse them instead of
+      # paying for a second emulated build (D16; wiring lands with S4).
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target.artifact }}
+          path: src/${{ matrix.target.artifact_glob }}
+          if-no-files-found: error
+          retention-days: 90

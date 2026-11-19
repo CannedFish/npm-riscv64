@@ -1,0 +1,77 @@
+name: "build @ruyisdk/bufferutil@4.2.0 (riscv64)"
+description: "Generated from packages/@ruyisdk/bufferutil/4.2.0 by scripts/render.py - do not edit by hand."
+# The name uses the publish target, so a fork that rewrites the scope (PUBLISH_SCOPE)
+# shows the package it actually publishes.
+
+# The riscv64 container is pinned here on purpose: changing this template changes
+# every recipe, and a template change forces a full rebuild (see .dsh/plan.md D7).
+# Override the image at run time with the RISCV_IMAGE environment variable.
+
+inputs:
+  publish:
+    description: "Publish the built packages to their registries"
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: prepare riscv64 emulation
+      shell: bash
+      run: |
+        set -euo pipefail
+        image="${RISCV_IMAGE:-npm-riscv64/toolchain:riscv64}"
+        echo "riscv image: $image"
+        if ! docker image inspect "$image" >/dev/null 2>&1; then
+          echo "image not present locally, pulling $image"
+          if ! docker pull "$image"; then
+            echo "ERROR: cannot pull $image" >&2
+            echo "Set RISCV_IMAGE to a reachable image (see the toolchain-image workflow)," >&2
+            echo "or build it locally:" >&2
+            echo "  docker build -f docker/riscv64-toolchain.Dockerfile -t npm-riscv64/toolchain:riscv64 ." >&2
+            exit 1
+          fi
+        fi
+        docker run --rm --platform linux/riscv64 "$image" uname -m
+
+    # 1/5 - fetch: upstream > source > npm, falling through only on failure.
+    - name: fetch upstream source
+      shell: bash
+      run: |
+        set -euo pipefail
+        image="${RISCV_IMAGE:-npm-riscv64/toolchain:riscv64}"
+        docker run --rm --platform linux/riscv64 \
+          -v "$GITHUB_WORKSPACE:/w" -w /w \
+          -e SRC_DIR=src -e TMP_DIR=.fetch-tmp \
+          "$image" bash "/w/.rendered/action/steps/fetch.sh"
+
+    # 3/5 - build
+    - name: build
+      shell: bash
+      run: |
+        set -euo pipefail
+        image="${RISCV_IMAGE:-npm-riscv64/toolchain:riscv64}"
+        docker run --rm --platform linux/riscv64 \
+          -v "$GITHUB_WORKSPACE:/w" -w "/w/src/" \
+          -e SRC_DIR=src \
+          "$image" bash "/w/.rendered/action/steps/build.sh"
+
+    # 4/5 - test: also asserts the artifact really is a RISC-V object.
+    - name: test
+      shell: bash
+      run: |
+        set -euo pipefail
+        image="${RISCV_IMAGE:-npm-riscv64/toolchain:riscv64}"
+        docker run --rm --platform linux/riscv64 \
+          -v "$GITHUB_WORKSPACE:/w" -w "/w/src/" \
+          -e SRC_DIR=src \
+          "$image" bash "/w/.rendered/action/steps/test.sh"
+
+    # 5/5 - publish: runs on the host, no emulation needed to move files and
+    # talk to a registry.
+    - name: publish
+      if: inputs.publish == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        bash ".rendered/action/steps/publish.sh"
