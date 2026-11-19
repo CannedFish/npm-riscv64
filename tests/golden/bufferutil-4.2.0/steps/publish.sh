@@ -1,0 +1,106 @@
+set -euo pipefail
+
+# Publishing runs on the host: moving files and talking to a registry does
+# not need riscv64 emulation, and it keeps token handling straightforward.
+REPO_ROOT="$(pwd)"
+SRC_DIR="${SRC_DIR:-src}"
+ARTIFACT_GLOB="$SRC_DIR/prebuilds/linux-riscv64/*.node"
+export NPM_CONFIG_USERCONFIG="$REPO_ROOT/.npmrc.publish"
+: > "$NPM_CONFIG_USERCONFIG"
+
+log() { echo "[publish] $*"; }
+
+setup_auth() {
+  local registry="$1" token_env="$2"
+  [ -n "$token_env" ] || return 0
+  if [ -z "${!token_env:-}" ]; then
+    log "no token in $token_env; talking to $registry unauthenticated"
+    return 0
+  fi
+  local host="${registry#*://}"; host="${host%%/*}"
+  printf '//%s/:_authToken=${%s}\n' "$host" "$token_env" >> "$NPM_CONFIG_USERCONFIG"
+  log "auth configured for $host via $token_env"
+}
+
+publish_one() {
+  local rel_dir="$1" name="$2" version="$3" registry="$4" mode="$5"
+  local req_name="$6" req_version="$7" os_name="$8" cpu_name="$9"
+  # dir is relative to the fetched source tree, never to the repository root.
+  local dir="$SRC_DIR/$rel_dir"
+  log "package $name@$version (dir=$dir, manifest=$mode)"
+  local main_file=""
+  if [ "$rel_dir" != "." ]; then
+    mkdir -p "$dir"
+    local f
+    for f in $ARTIFACT_GLOB; do
+      [ -e "$f" ] || continue
+      cp -v "$f" "$dir/"
+      main_file=$(basename "$f")
+    done
+  fi
+  # Always publish an absolute path: npm reads a two-segment relative path
+  # such as "src/." as a github shorthand spec, not as a directory.
+  local abs_dir
+  abs_dir=$(cd "$dir" && pwd) || { log "cannot enter $dir"; return 1; }
+  node -e 'const fs=require("node:fs");
+const path=require("node:path");
+const args=process.argv.slice(1);
+const dir=args[0], name=args[1], version=args[2], mode=args[3];
+const reqName=args[4]||"", reqVersion=args[5]||"", mainFile=args[6]||"";
+const osName=args[7]||"", cpuName=args[8]||"";
+const file=path.join(dir, "package.json");
+const exists=fs.existsSync(file);
+if (mode === "verify") {
+  if (!exists) {
+    console.error("[publish] missing manifest: " + file);
+    process.exit(1);
+  }
+  const pkg=JSON.parse(fs.readFileSync(file, "utf8"));
+  if (pkg.name !== name) {
+    console.error("[publish] name mismatch: manifest has " + pkg.name + ", recipe wants " + name);
+    console.error("[publish] a rename would publish a different package; refusing");
+    process.exit(1);
+  }
+  if (String(pkg.version) !== String(version)) {
+    console.error("[publish] version mismatch: manifest has " + pkg.version + ", recipe wants " + version);
+    process.exit(1);
+  }
+  if (reqName && (pkg.optionalDependencies || {})[reqName] !== reqVersion) {
+    console.error("[publish] " + reqName + " must be pinned to " + reqVersion + " in optionalDependencies");
+    process.exit(1);
+  }
+  process.exit(0);
+}
+if (mode !== "generate" && mode !== "verify") {
+  console.error("[publish] unknown manifest mode: " + mode);
+  process.exit(1);
+}
+const pkg = exists ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+pkg.name = name;
+pkg.version = version;
+if (mainFile && !pkg.main) { pkg.main = mainFile; }
+if (osName) { pkg.os = [osName]; }
+if (cpuName) { pkg.cpu = [cpuName]; }
+if (reqName) {
+  pkg.optionalDependencies = pkg.optionalDependencies || {};
+  pkg.optionalDependencies[reqName] = reqVersion;
+}
+fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");
+console.log("[publish] wrote " + file + " (" + mode + ")");
+' "$dir" "$name" "$version" "$mode" "$req_name" "$req_version" "$main_file" "$os_name" "$cpu_name"
+  if npm view "$name@$version" version --registry "$registry" >/dev/null 2>&1; then
+    log "already published: $name@$version (skipped)"
+    return 0
+  fi
+  npm publish "$abs_dir" --registry "$registry" --access public \
+    --ignore-scripts --no-audit --no-fund
+}
+
+# Credentials first: the idempotency probe itself may need auth.
+setup_auth "https://npm.pkg.github.com" "NODE_AUTH_TOKEN"
+
+# Publish order: native/binary packages first, then the JS package that
+# references them through optionalDependencies.
+publish_one "." "@ruyisdk/bufferutil" "4.2.0" "https://npm.pkg.github.com" "generate" "" "" "" ""
+
+log "publish finished for @ruyisdk/bufferutil@4.2.0"
