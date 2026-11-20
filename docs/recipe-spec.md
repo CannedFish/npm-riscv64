@@ -238,27 +238,47 @@ the same script serves both triggers:
 
 | change | selection |
 | --- | --- |
-| `packages/<pkg>/<ver>/**` | that version |
+| `packages/<pkg>/<ver>/**` | that version, always built |
 | `packages/<pkg>/common/**` | every version of that package |
-| `.github/templates/action.template.yml` | every recipe (the container and step order changed) |
-| `scripts/**` | no build; renderer self-check (`--check-all`) |
+| a **global build input** (`.github/templates/**`, `scripts/**`) | every recipe is a *candidate*, then narrowed by comparing build cache keys with the base commit |
+| `docker/**` | every recipe (the image digest is only known after the image is rebuilt) |
 | anything else | nothing |
 
 Pull requests use a three-dot diff against the merge base, pushes a two-dot diff;
 an all-zero `before` (new branch, force push) rebuilds everything. A selected
 version directory without `.stat` fails the run before any build starts.
 
+The narrowing matters because a global input can change the *action* without changing
+a single executed command - adding an input, an `if:` guard or a comment. The artifact
+cannot differ then, so the recipe is not rebuilt. Narrowing reuses the cache key
+(`narrow_by_build_inputs`), so "changed" means exactly what the cache means by it. It
+compares the base commit's own `scripts/build_key.py` when that revision shipped one
+(a renderer change then shows up as changed commands); if it did not, the current tool
+renders the base tree instead. Whenever the comparison is impossible - no base commit,
+unreadable recipe, unusable checkout - every candidate is kept.
+
+`scripts/**` also keeps the renderer self-check (`--check-all`) running.
+
 ## 9. Build cache
 
 Rebuilding the same recipe with the same inputs produces the same bytes, so a
 finished workspace tree is cached as an artifact and restored instead of rebuilt.
 
-Key (`scripts/build_key.py`) - every input that can change the artifact:
+Key (`scripts/build_key.py`) - the *rendered* commands that produce the artifact:
 
-* the version directory (`.stat`, `commands/`, `patches/`),
-* the package's `common/` layer,
-* `.github/templates/`, `scripts/`, `docker/`,
-* the resolved container image id.
+* the rendered `run:` blocks of the fetch, patch and build steps (image, mounts,
+  working directory, environment, flags),
+* the rendered `steps/{fetch,patch,build}.sh` bodies (fetch and patch are generated
+  from the template and the `.stat`; build is the recipe snippet),
+* the patch files, which the patch step reads from the repository at run time,
+* the resolved container image id,
+* anything passed with `--extra`.
+
+Hashing the rendered commands rather than the source files makes the key precise in
+both directions: a renderer or template change that alters the generated commands
+changes the key (no separate input needed), while an edit that only touches an input,
+an `if:` guard, a comment, the `test` snippet, the `publish` snippet or a publish-only
+`.stat` field leaves it alone - the artifact cannot differ.
 
 Nothing else can influence the output, so a hit cannot be stale: no diff against the
 source branch is needed, and the same key is produced by a pull request and by the

@@ -81,10 +81,15 @@ docker build -f docker/riscv64-toolchain.Dockerfile -t npm-riscv64/toolchain:ris
 
 ## Caching
 
-A finished workspace tree is uploaded as an artifact keyed by a hash of its inputs
-(recipe, common layer, template, renderer, toolchain, image id). A later run with the
-same key restores the tree and skips fetch, patch and build - the test step still runs,
-and publish works off the restored tree. A miss just builds.
+A finished workspace tree is uploaded as an artifact keyed by a hash of the *rendered*
+build commands (the fetch/patch/build steps, the patch files, the image id). A later run
+with the same key restores the tree and skips fetch, patch and build - the test step
+still runs, and publish works off the restored tree. A miss just builds.
+
+Because the key describes what actually runs, it also decides what a change touches: a
+template or renderer edit that adds an input, an `if:` guard or a comment changes no
+command, so no recipe is rebuilt, while recipe changes always rebuild. See
+`docs/recipe-spec.md` for the exact rules.
 
 ## Container image
 
