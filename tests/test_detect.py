@@ -142,11 +142,17 @@ class DetectTests(unittest.TestCase):
             [("@scope/demo", "2.0.0"), ("plain", "1.0.0"), ("plain", "1.1.0")],
         )
 
-    def test_scripts_change_requests_self_check_only(self):
+    def test_scripts_change_requests_self_check_and_candidates(self):
+        # The renderer generates the fetch/patch commands, so it is a global build input:
+        # every recipe becomes a candidate and is narrowed by key comparison (see
+        # BuildInputNarrowingTests). Without a base commit nothing is narrowed away.
         self.repo.write("scripts/render.py", "# changed\n")
         result = self.run_detect()
         self.assertTrue(result["self_check"])
-        self.assertEqual(result["targets"], [])
+        self.assertEqual(
+            sorted(result["targets"]),
+            [("@scope/demo", "2.0.0"), ("plain", "1.0.0"), ("plain", "1.1.0")],
+        )
 
     def test_documentation_change_builds_nothing(self):
         self.repo.write("README.md", "docs\n")
@@ -230,6 +236,172 @@ class DetectOutputTests(unittest.TestCase):
             self.assertEqual(payload[0]["slug"], "scope-demo/2.0.0")
             self.assertEqual(payload[0]["artifact"], "scope-demo-2.0.0-riscv64")
             self.assertEqual(payload[0]["artifact_glob"], "build/*.node")
+
+
+class BuildInputNarrowingTests(unittest.TestCase):
+    """A global input change selects every recipe, then narrows by comparing keys.
+
+    The narrowing is what keeps a template-only pull request from rebuilding packages it
+    never touched: the edit may change the action without changing a single executed
+    command. The tests drive the same three steps the job runs - path rules, base commit,
+    key comparison - plus ``main`` for the fallbacks.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.root = root
+        self.repo = GitFixture(root)
+        # The narrowing runs the *base* checkout's own tool, so the fixture carries the
+        # real scripts and the real template; a stub would not render.
+        for name in ("recipe_lib.py", "render.py", "build_key.py"):
+            self.repo.write(
+                f"scripts/{name}", (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8")
+            )
+        self.repo.write(TEMPLATE, (REPO_ROOT / TEMPLATE).read_text(encoding="utf-8"))
+        self.repo.recipe("plain", "1.0.0")
+        self.repo.recipe("@scope/demo", "2.0.0")
+        base = self.repo.commit("base")
+        self.repo.mark_origin_main(base)
+        self.repo.branch()
+        self.packages = root / "packages"
+        self.everything = [("@scope/demo", "2.0.0"), ("plain", "1.0.0")]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def rewrite_template(self, mutate) -> None:
+        path = self.root / TEMPLATE
+        path.write_text(mutate(path.read_text(encoding="utf-8")), encoding="utf-8")
+
+    def insert_after_step_start(self, step: str, line: str) -> None:
+        def mutate(text: str) -> str:
+            lines = text.splitlines(keepends=True)
+            start = next(i for i, v in enumerate(lines) if v.strip() == f"- name: {step}")
+            run = next(i for i, v in enumerate(lines[start:], start) if v.strip() == "run: |")
+            indent = " " * (len(lines[run]) - len(lines[run].lstrip()) + 2)
+            lines.insert(run + 1, indent + line + "\n")
+            return "".join(lines)
+
+        self.rewrite_template(mutate)
+
+    def add_template_input(self) -> None:
+        self.rewrite_template(
+            lambda text: text.replace("  publish:\n", '  probe:\n    default: "x"\n  publish:\n', 1)
+        )
+
+    def detect(self) -> dict:
+        head = self.repo.commit("feature change")
+        changed, rebuild_all = dt.changed_files("pull_request", "main", head, head, cwd=self.root)
+        explicit, candidates, self_check = dt.path_rules(
+            self.packages, changed, TEMPLATE, rebuild_all
+        )
+        narrowed = dt.narrow_by_build_inputs(
+            self.packages,
+            TEMPLATE,
+            dt.base_commit("pull_request", "main", head, "", cwd=self.root),
+            candidates,
+            cwd=self.root,
+        )
+        targets = dt.merge(explicit, narrowed if narrowed is not None else candidates)
+        return {
+            "targets": [(t.pkg, t.ver) for t in targets],
+            "candidates": [(t.pkg, t.ver) for t in candidates],
+            "explicit": [(t.pkg, t.ver) for t in explicit],
+            "self_check": self_check,
+            "compared": narrowed is not None,
+        }
+
+    def run_main(self, *, event: str, before: str) -> dict:
+        head = self.repo.commit("feature change")
+        output = self.root / "github_output"
+        output.write_text("", encoding="utf-8")
+        env = dict(os.environ)
+        env.update(
+            EVENT_NAME=event,
+            BASE_REF="main",
+            HEAD_SHA=head,
+            BEFORE_SHA=before,
+            GITHUB_OUTPUT=str(output),
+            RECIPE_ROOT="packages",
+            TEMPLATE_PATH=TEMPLATE,
+        )
+        saved = dict(os.environ)
+        os.environ.update(env)
+        try:
+            code = dt.main(cwd=self.root)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+        self.assertEqual(code, 0)
+        keys = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
+        return json.loads(keys["targets"])
+
+    def test_cosmetic_template_change_builds_nothing(self):
+        # an extra input and an if: guard change the action, not the build
+        self.add_template_input()
+        self.rewrite_template(
+            lambda text: text.replace(
+                "    - name: fetch upstream source\n",
+                "    - name: fetch upstream source\n      if: inputs.reuse != 'true'\n",
+                1,
+            )
+        )
+        result = self.detect()
+        self.assertTrue(result["compared"])
+        self.assertEqual(result["candidates"], self.everything)
+        self.assertEqual(result["targets"], [])
+
+    def test_template_build_command_change_rebuilds_everything(self):
+        self.insert_after_step_start("build", "echo probe-build")
+        result = self.detect()
+        self.assertEqual(result["targets"], self.everything)
+
+    def test_recipe_change_survives_narrowing(self):
+        # The recipe's own change is explicit: kept even though it compares equal.
+        self.repo.write("packages/plain/1.0.0/commands/test", "echo new test\n")
+        self.add_template_input()
+        result = self.detect()
+        self.assertEqual(result["explicit"], [("plain", "1.0.0")])
+        self.assertEqual(result["targets"], [("plain", "1.0.0")])
+
+    def test_renderer_edit_without_output_change_builds_nothing(self):
+        before = (REPO_ROOT / "scripts" / "render.py").read_text(encoding="utf-8")
+        self.repo.write("scripts/render.py", before + "\n# comment only\n")
+        result = self.detect()
+        self.assertTrue(result["self_check"])
+        self.assertEqual(result["targets"], [])
+
+    def test_base_without_the_tool_still_compares(self):
+        # A base that predates scripts/build_key.py: the head tool renders its tree.
+        (self.root / "scripts" / "build_key.py").unlink()
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-qm", "drop the tool")
+        self.repo.mark_origin_main(git(self.root, "rev-parse", "HEAD").strip())
+        self.repo.write(
+            "scripts/build_key.py",
+            (REPO_ROOT / "scripts" / "build_key.py").read_text(encoding="utf-8"),
+        )
+        self.add_template_input()
+        result = self.detect()
+        self.assertTrue(result["compared"])
+        self.assertEqual(result["targets"], [])
+
+    def test_new_branch_still_rebuilds_everything(self):
+        # No base commit to compare with: fall back to building every recipe.
+        self.add_template_input()
+        payload = self.run_main(event="push", before="0" * 40)
+        self.assertEqual(
+            sorted((entry["pkg"], entry["ver"]) for entry in payload), self.everything
+        )
+
+    def test_main_narrows_a_cosmetic_template_change(self):
+        self.add_template_input()
+        payload = self.run_main(event="push", before=self.repo_previous_commit())
+        self.assertEqual(payload, [])
+
+    def repo_previous_commit(self) -> str:
+        return git(self.root, "rev-parse", "HEAD").strip()
 
 
 if __name__ == "__main__":
