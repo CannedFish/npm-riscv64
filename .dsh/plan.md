@@ -706,3 +706,28 @@ Dockerfile、镜像 ID、无关配方不失效、`.pyc` 忽略）；模板新增
 | 恢复后带 `reuse` 跑 | `fetch`、`build` 均 `skipped by if-condition`；`test` 执行并通过（`round-tripped 23 bytes`） |
 | 恢复后 `--publish`（verdaccio） | `[publish] wrote src/package.json (generate)` → `+ @ruyisdk/bufferutil@4.2.0` |
 | 解包属主 | 加 `--no-same-owner`，树归属 runner 而非打包者 |
+
+### 13.10 第二个配方：`@ruyisdk/utf-8-validate` 6.0.6（2026-11-19）
+
+按 D21 的备选落第二个真实配方，并用它复验上一轮的 artifact 复用。
+
+| 项 | 内容 |
+|---|---|
+| 上游 | `websockets/utf-8-validate` @ `v6.0.6`（无 `.gitmodules`，`deps/is_utf8` 是 vendored 源码，普通 clone 即可） |
+| ABI | N-API（`src/validation.cc` 以 `NAPI_MODULE` 结尾）⇒ 一份制品覆盖所有 Node 版本，不需要按 ABI 出多份 prebuild |
+| 构建 | `npm install --ignore-scripts` → `node-gyp rebuild` → 把 `build/Release/validation.node` **改名**为 `prebuilds/linux-riscv64/utf-8-validate.node`（`binding.gyp` 的 target 叫 `validation`，而 node-gyp-build 按包名找文件） |
+| 测试 | 隐藏 `build/` → `node-gyp-build` 解析出 prebuild 路径（断言以 `utf-8-validate.node` 结尾）→ `require` 该路径（dlopen 成功即证明架构正确）→ 5 条断言：空缓冲/ASCII/4 字节序列合法，lone surrogate 与截断序列非法 |
+| 发布 | 与 bufferutil 同构：单包、`generate_manifest: true`、`@ruyisdk/utf-8-validate@6.0.6` |
+
+验证：
+
+| 检查 | 结果 |
+|---|---|
+| `--check-all` | 2 个配方，0 失败 |
+| L0 | 70 个用例通过 |
+| L1 | fetch → build → test 全绿；产物 `ELF 64-bit LSB shared object, UCB RISC-V, RVC, double-float ABI`；`utf-8-validate ok: ... answered 5 cases` |
+| 变更检测 | 只改新配方 → 只选它；改模板 → 两个都选；改渲染器 → 只自检；只改文档 → 无目标 |
+| **复用（本轮重点）** | 真构建后打包 6.6 MB（排除 `.git`）→ 恢复到新沙箱 → `--reuse` 跑：`fetch`/`build` 均 skipped，`test` 通过，`publish` 出版成功 `+ @ruyisdk/utf-8-validate@6.0.6` |
+| key 敏感性 | 往 `commands/build` 末尾加一行注释 → key 从 `2de2921bfb27` 变为 `751331d8f064`；还原后回到原值 |
+
+第二个配方顺带验证了「配方内容差异不会污染 key」：两个配方的 key 不同、互不影响，改模板则两者同时失效。
