@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Verifies the utf-8-validate prebuild the way a consumer will use it: no build/
+# directory, node-gyp-build must resolve the riscv64 prebuild, and the native
+# validator must answer correctly on this architecture.
+set -euo pipefail
+
+artifact="prebuilds/linux-riscv64/utf-8-validate.node"
+
+if [ ! -f "$artifact" ]; then
+  echo "ERROR: missing artifact $artifact" >&2
+  exit 1
+fi
+echo "artifact: $artifact"
+file "$artifact"
+if ! file "$artifact" | grep -Eqi 'risc-?v'; then
+  echo "ERROR: artifact is not a RISC-V object" >&2
+  exit 1
+fi
+
+# node-gyp-build prefers build/Release when present, so hide it: a package
+# installed from the registry only ships prebuilds/.
+if [ -d build ]; then
+  mv build build.hidden
+  trap 'mv build.hidden build' EXIT
+fi
+
+node - <<'EOF'
+const assert = require('node:assert');
+
+const resolved = require('node-gyp-build').path(__dirname);
+assert.ok(
+  resolved.endsWith('prebuilds/linux-riscv64/utf-8-validate.node'),
+  `expected the riscv64 prebuild, got: ${resolved}`
+);
+
+// The addon is N-API and exports the validator function itself, so requiring the
+// resolved path also proves this ELF loads on this architecture.
+const isValidUTF8 = require(resolved);
+assert.strictEqual(typeof isValidUTF8, 'function', 'the addon must export isValidUTF8');
+
+assert.strictEqual(isValidUTF8(Buffer.alloc(0)), true, 'empty buffer is valid UTF-8');
+assert.strictEqual(isValidUTF8(Buffer.from('ruyi-riscv64-utf8')), true, 'ASCII is valid');
+assert.strictEqual(
+  isValidUTF8(Buffer.from([0xf0, 0x90, 0x80, 0x80])),
+  true,
+  'a 4-byte sequence (U+10000) is valid'
+);
+assert.strictEqual(
+  isValidUTF8(Buffer.from([0xed, 0xa0, 0x80])),
+  false,
+  'a lone surrogate must be rejected'
+);
+assert.strictEqual(isValidUTF8(Buffer.from([0xc3])), false, 'a truncated sequence must be rejected');
+
+console.log(`utf-8-validate ok: ${resolved} answered 5 cases`);
+EOF
