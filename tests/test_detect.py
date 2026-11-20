@@ -109,9 +109,12 @@ class DetectTests(unittest.TestCase):
         changed, rebuild_all = dt.changed_files(
             event, base_ref, head, before or head, cwd=self.repo.root
         )
-        targets, self_check = dt.resolve_targets(
+        # No base commit is compared here: path rules alone, which is what the
+        # narrowing tests start from.
+        explicit, candidates, self_check = dt.path_rules(
             self.packages, changed, TEMPLATE, rebuild_all
         )
+        targets = dt.merge(explicit, candidates)
         return {
             "targets": [(t.pkg, t.ver) for t in targets],
             "self_check": self_check,
@@ -179,7 +182,8 @@ class DetectTests(unittest.TestCase):
             "push", "main", head, "0" * 40, cwd=self.repo.root
         )
         self.assertTrue(rebuild_all)
-        targets, _ = dt.resolve_targets(self.packages, changed, TEMPLATE, rebuild_all)
+        explicit, candidates, _ = dt.path_rules(self.packages, changed, TEMPLATE, rebuild_all)
+        targets = dt.merge(explicit, candidates)
         self.assertEqual(len(targets), 3)
 
     def test_push_range_selects_only_changed_recipe(self):
@@ -190,7 +194,8 @@ class DetectTests(unittest.TestCase):
             "push", "main", head, before, cwd=self.repo.root
         )
         self.assertFalse(rebuild_all)
-        targets, _ = dt.resolve_targets(self.packages, changed, TEMPLATE, rebuild_all)
+        explicit, candidates, _ = dt.path_rules(self.packages, changed, TEMPLATE, rebuild_all)
+        targets = dt.merge(explicit, candidates)
         self.assertEqual([(t.pkg, t.ver) for t in targets], [("@scope/demo", "2.0.0")])
 
 

@@ -136,21 +136,6 @@ def path_rules(
     return [selected[key] for key in sorted(selected)], candidates, self_check
 
 
-def resolve_targets(
-    root: Path, changed: list[str], template_path: str, rebuild_all: bool
-) -> tuple[list[rl.Target], bool]:
-    """Map changed paths onto build targets without comparing build inputs.
-
-    Kept for callers that have no base commit to compare against (and for the tests):
-    a global input change selects every recipe.
-    """
-    explicit, candidates, self_check = path_rules(root, changed, template_path, rebuild_all)
-    if candidates and (rebuild_all or template_path in changed):
-        reason = "template change" if template_path in changed else "full rebuild"
-        print(f"# {reason}: selecting every recipe", file=sys.stderr)
-    return merge(explicit, candidates), self_check
-
-
 def merge(*groups: list[rl.Target]) -> list[rl.Target]:
     """Union of target lists, sorted and de-duplicated."""
     selected: dict[tuple[str, str], rl.Target] = {}
