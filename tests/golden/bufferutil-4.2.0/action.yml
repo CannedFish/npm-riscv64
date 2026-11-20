@@ -17,6 +17,10 @@ inputs:
     description: "Publish the built packages to their registries"
     required: false
     default: "false"
+  reuse:
+    description: "The workspace tree was restored from the build cache: skip fetch, patch and build"
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -40,8 +44,13 @@ runs:
         mkdir -p "$GITHUB_WORKSPACE/.container-home"
         docker run --rm --platform linux/riscv64 "$image" uname -m
 
+    # A cache hit means the same inputs already produced this tree, so the three
+    # steps that create it are skipped. The test step still runs: a restored
+    # artifact has to be validated like a fresh one (D16).
+    #
     # 1/5 - fetch: upstream > source > npm, falling through only on failure.
     - name: fetch upstream source
+      if: inputs.reuse != 'true'
       shell: bash
       run: |
         set -euo pipefail
@@ -55,6 +64,7 @@ runs:
 
     # 3/5 - build
     - name: build
+      if: inputs.reuse != 'true'
       shell: bash
       run: |
         set -euo pipefail

@@ -30,14 +30,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 STEPS_DIR = ".rendered/action"
 
 
-def evaluate_if(condition: str | None, publish: bool) -> bool:
+def evaluate_if(condition: str | None, **inputs: bool) -> bool:
+    """Evaluate the small subset of `if:` expressions the template uses."""
     if not condition:
         return True
     text = condition.strip()
-    if text in ("inputs.publish == 'true'", 'inputs.publish == "true"'):
-        return publish
-    if text in ("inputs.publish != 'true'", "inputs.publish != \"true\""):
-        return not publish
+    for name, value in inputs.items():
+        for quote in ("'", '"'):
+            if text == f"inputs.{name} == {quote}true{quote}":
+                return value
+            if text == f"inputs.{name} != {quote}true{quote}":
+                return not value
     raise SystemExit(f"unsupported if condition in the action template: {text}")
 
 
@@ -53,6 +56,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", help="comma separated step names to run (substring match)")
     parser.add_argument("--skip", help="comma separated step names to skip (substring match)")
     parser.add_argument("--publish", action="store_true", help="also run the publish step")
+    parser.add_argument(
+        "--reuse",
+        action="store_true",
+        help="pretend the tree came from the build cache (skip fetch, patch and build)",
+    )
     parser.add_argument(
         "--image",
         default=os.environ.get("RISCV_IMAGE", "npm-riscv64/toolchain:riscv64"),
@@ -122,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
         if "run" not in step:
             print(f"\n=== skipping non-run step: {name}")
             continue
-        if not evaluate_if(step.get("if"), args.publish):
+        if not evaluate_if(step.get("if"), publish=args.publish, reuse=args.reuse):
             print(f"\n=== skipped by if-condition: {name}")
             continue
         if only and not any(token in name for token in only):

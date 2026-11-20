@@ -267,6 +267,11 @@ npm_publish:
 
 ### 5.1 artifact 复用的定位链（D16）
 
+> **实现变更（2026-11-19）**：实际落地的不是下面这条「合并提交 → PR head → run」定位链，
+> 而是**内容寻址**：构建产物只由「配方 + common 层 + 模板 + 渲染器 + 工具链 + 镜像 ID」决定，
+> 把这几项哈希成 key 并写进 artifact 名，命中即等价、无需 diff 校验，也顺带覆盖直推 main 与
+> 重跑同一 commit 的情况。详见 §13.9。下面保留原始设计以备对照。
+
 ```
 merge_sha = github.sha
   → gh api repos/{owner}/{repo}/commits/{merge_sha}/pulls  → 已合并 PR 的 head SHA
@@ -675,3 +680,54 @@ Docker 持有凭据后不会回退匿名。改法：仅当 secret `GHCR_TOKEN` �
 | 同上再跑发布（verdaccio） | `[publish] wrote src/package.json (generate)` → `+ @ruyisdk/bufferutil@4.2.0` |
 
 默认（uid 0）路径同时回归通过，L0 51 个用例与 golden 已刷新。
+
+### 13.9 artifact 复用落地（S4 收尾，2026-11-19）
+
+L3 全线跑通后按约定补上 D16 的缺口。原设计的定位链（合并提交 → PR head → run → download →
+`git diff` 校验过期）换成**内容寻址**，理由：
+
+| 原设计 | 落地做法 | 为什么更好 |
+|---|---|---|
+| 用 `commits/{sha}/pulls` 找 PR head，再按 commit 找 run | `scripts/build_key.py` 对「配方 + common + 模板 + scripts + docker + 镜像 ID」求哈希，key 写进 artifact 名 | 命中即证明输入相同，不需要再 `git diff` 判过期；直推 main、重跑同一 commit 同样能命中；少两次 API 往返与一类竞态（两个 PR 先后合入） |
+| 缓存对象 = 构建产物（`.node`） | 缓存对象 = **整棵 `src/` 树**（排除 `.git`） | 发布需要源码树、测试需要 `node_modules`（否则 prebuild 解析路径与消费者行为不一致），只缓存 `.node` 反而跑不下去 |
+| main 侧复用 | PR 与 main 都复用 | 同一个 key 命中即同一份输入；PR 反复推同一个配方不再重建 |
+
+实现：`scripts/build_key.py`（含 18 个 L0 用例：稳定/敏感两个方向、common 层、模板、渲染器、
+Dockerfile、镜像 ID、无关配方不失效、`.pyc` 忽略）；模板新增 `reuse` 输入，`fetch`/`patch`/
+`build` 三步加 `if: inputs.reuse != 'true'`，**`test` 始终执行**、`publish` 语义不变；工作流新增
+「算 key → 尝试恢复（`continue-on-error`，查不到就回退重建）→ 用后打包上传」三步，权限补
+`actions: read`。
+
+验证（本地，用 `.dsh/tmp/cache-a` 真构建后打包、再恢复到 `cache-b` 跑）：
+
+| 检查 | 结果 |
+|---|---|
+| 打包体积 / 条目 | 4.1 MB / 2382 条（`--exclude=.git`） |
+| 恢复后带 `reuse` 跑 | `fetch`、`build` 均 `skipped by if-condition`；`test` 执行并通过（`round-tripped 23 bytes`） |
+| 恢复后 `--publish`（verdaccio） | `[publish] wrote src/package.json (generate)` → `+ @ruyisdk/bufferutil@4.2.0` |
+| 解包属主 | 加 `--no-same-owner`，树归属 runner 而非打包者 |
+
+### 13.10 第二个配方：`@ruyisdk/utf-8-validate` 6.0.6（2026-11-19）
+
+按 D21 的备选落第二个真实配方，并用它复验上一轮的 artifact 复用。
+
+| 项 | 内容 |
+|---|---|
+| 上游 | `websockets/utf-8-validate` @ `v6.0.6`（无 `.gitmodules`，`deps/is_utf8` 是 vendored 源码，普通 clone 即可） |
+| ABI | N-API（`src/validation.cc` 以 `NAPI_MODULE` 结尾）⇒ 一份制品覆盖所有 Node 版本，不需要按 ABI 出多份 prebuild |
+| 构建 | `npm install --ignore-scripts` → `node-gyp rebuild` → 把 `build/Release/validation.node` **改名**为 `prebuilds/linux-riscv64/utf-8-validate.node`（`binding.gyp` 的 target 叫 `validation`，而 node-gyp-build 按包名找文件） |
+| 测试 | 隐藏 `build/` → `node-gyp-build` 解析出 prebuild 路径（断言以 `utf-8-validate.node` 结尾）→ `require` 该路径（dlopen 成功即证明架构正确）→ 5 条断言：空缓冲/ASCII/4 字节序列合法，lone surrogate 与截断序列非法 |
+| 发布 | 与 bufferutil 同构：单包、`generate_manifest: true`、`@ruyisdk/utf-8-validate@6.0.6` |
+
+验证：
+
+| 检查 | 结果 |
+|---|---|
+| `--check-all` | 2 个配方，0 失败 |
+| L0 | 70 个用例通过 |
+| L1 | fetch → build → test 全绿；产物 `ELF 64-bit LSB shared object, UCB RISC-V, RVC, double-float ABI`；`utf-8-validate ok: ... answered 5 cases` |
+| 变更检测 | 只改新配方 → 只选它；改模板 → 两个都选；改渲染器 → 只自检；只改文档 → 无目标 |
+| **复用（本轮重点）** | 真构建后打包 6.6 MB（排除 `.git`）→ 恢复到新沙箱 → `--reuse` 跑：`fetch`/`build` 均 skipped，`test` 通过，`publish` 出版成功 `+ @ruyisdk/utf-8-validate@6.0.6` |
+| key 敏感性 | 往 `commands/build` 末尾加一行注释 → key 从 `2de2921bfb27` 变为 `751331d8f064`；还原后回到原值 |
+
+第二个配方顺带验证了「配方内容差异不会污染 key」：两个配方的 key 不同、互不影响，改模板则两者同时失效。

@@ -79,6 +79,13 @@ L1 and L2 need docker. For L1, build the toolchain image once:
 docker build -f docker/riscv64-toolchain.Dockerfile -t npm-riscv64/toolchain:riscv64 .
 ```
 
+## Caching
+
+A finished workspace tree is uploaded as an artifact keyed by a hash of its inputs
+(recipe, common layer, template, renderer, toolchain, image id). A later run with the
+same key restores the tree and skips fetch, patch and build - the test step still runs,
+and publish works off the restored tree. A miss just builds.
+
 ## Container image
 
 Build and test run inside a riscv64 image. It is **not** built on every run: build it
