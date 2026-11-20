@@ -1,9 +1,10 @@
 """Build cache key tests (L0).
 
-The key decides whether a previous tree is restored instead of rebuilding, so it
-has to be both stable (same inputs, same key) and sensitive (any input change, new
-key). Both directions are tested, plus the property that unrelated recipes do not
-invalidate a key.
+The key decides whether a previous tree is restored instead of rebuilt, so it has to be
+stable (same build inputs, same key) and sensitive (a changed build input, a new key).
+Because the key is computed from the *rendered* commands, the tests also pin the other
+direction: edits that cannot change the artifact - a template input, an ``if:`` guard, a
+test snippet, a publish-only ``.stat`` field - must leave the key alone.
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import build_key  # noqa: E402
 
+REAL_TEMPLATE = (REPO_ROOT / ".github/templates/action.template.yml").read_text(encoding="utf-8")
+
 STAT = """\
 upstream:
   repo: https://github.com/example/demo
@@ -32,12 +35,13 @@ npm_publish:
     name: "@demo/widget"
     version: 1.0.0
     dir: .
+    registry: https://example.invalid
     generate_manifest: true
 """
 
 
 class CacheRepo:
-    """A miniature repository: recipes plus the shared inputs a key hashes."""
+    """A miniature repository: recipes plus the template a key renders through."""
 
     def __init__(self, root: Path):
         self.root = root
@@ -55,9 +59,35 @@ class CacheRepo:
         self.write(f"{base}/commands/test", "file build/Release/*.node\n")
 
     def scaffold(self) -> None:
-        self.write(".github/templates/action.template.yml", "name: demo\n")
+        # The real template: the key hashes what rendering produces, so a stub would
+        # not exercise the code path the workflow uses.
+        self.write(".github/templates/action.template.yml", REAL_TEMPLATE)
         self.write("scripts/render.py", "print('render')\n")
         self.write("docker/toolchain.Dockerfile", "FROM debian:trixie-slim\n")
+
+    def template(self) -> str:
+        return (self.root / ".github/templates/action.template.yml").read_text(encoding="utf-8")
+
+    def rewrite_template(self, mutate) -> None:
+        path = self.root / ".github/templates/action.template.yml"
+        path.write_text(mutate(self.template()), encoding="utf-8")
+
+    def insert_after_step_start(self, step: str, line: str) -> None:
+        """Insert ``line`` at the top of a step's ``run:`` block."""
+
+        def mutate(text: str) -> str:
+            lines = text.splitlines(keepends=True)
+            start = next(
+                index for index, value in enumerate(lines) if value.strip() == f"- name: {step}"
+            )
+            run = next(
+                index for index, value in enumerate(lines[start:], start) if value.strip() == "run: |"
+            )
+            indent = " " * (len(lines[run]) - len(lines[run].lstrip()) + 2)
+            lines.insert(run + 1, indent + line + "\n")
+            return "".join(lines)
+
+        self.rewrite_template(mutate)
 
 
 class BuildKeyTests(unittest.TestCase):
@@ -73,6 +103,18 @@ class BuildKeyTests(unittest.TestCase):
     def key(self, pkg: str = "demo", **kwargs) -> str:
         return build_key.build_key(self.repo.root, pkg, "1.0.0", **kwargs)
 
+    def assert_key_changes(self, mutate) -> None:
+        before = self.key()
+        mutate()
+        self.assertNotEqual(before, self.key())
+
+    def assert_key_holds(self, mutate) -> None:
+        before = self.key()
+        mutate()
+        self.assertEqual(before, self.key())
+
+    # --- stability -----------------------------------------------------------
+
     def test_same_inputs_give_the_same_key(self):
         self.assertEqual(self.key(), self.key())
 
@@ -81,36 +123,47 @@ class BuildKeyTests(unittest.TestCase):
         self.assertEqual(len(value), 12)
         int(value, 16)
 
-    def test_recipe_snippet_change_invalidates(self):
+    # --- build inputs invalidate --------------------------------------------
+
+    def test_recipe_build_snippet_change_invalidates(self):
+        self.assert_key_changes(
+            lambda: self.repo.write("packages/demo/1.0.0/commands/build", "node-gyp rebuild\n")
+        )
+
+    def test_upstream_ref_change_invalidates(self):
+        self.assert_key_changes(
+            lambda: self.repo.write(
+                "packages/demo/1.0.0/.stat", STAT.replace("v1.0.0", "v1.0.1")
+            )
+        )
+
+    def test_common_patch_invalidates(self):
+        # the shared baseline sits next to the version directories and applies first
+        self.assert_key_changes(
+            lambda: self.repo.write("packages/demo/common/patches/0001-common.patch", "diff --git a b\n")
+        )
+
+    def test_common_snippet_overridden_by_the_version_keeps_the_key(self):
+        # the version layer wins, so the effective build command did not change
+        self.assert_key_holds(
+            lambda: self.repo.write("packages/demo/common/commands/build", "make\n")
+        )
+
+    def test_patch_content_invalidates(self):
+        self.repo.write("packages/demo/1.0.0/patches/0001-probe.patch", "diff --git a b\n")
         before = self.key()
-        self.repo.write("packages/demo/1.0.0/commands/build", "node-gyp rebuild\n")
+        self.repo.write("packages/demo/1.0.0/patches/0001-probe.patch", "diff --git a c\n")
         self.assertNotEqual(before, self.key())
 
-    def test_stat_change_invalidates(self):
-        before = self.key()
-        self.repo.write("packages/demo/1.0.0/.stat", STAT.replace("v1.0.0", "v1.0.1"))
-        self.assertNotEqual(before, self.key())
+    def test_template_build_command_change_invalidates(self):
+        self.assert_key_changes(
+            lambda: self.repo.insert_after_step_start("build", "echo probe-build")
+        )
 
-    def test_common_layer_change_invalidates(self):
-        before = self.key()
-        # the shared baseline sits next to the version directories
-        self.repo.write("packages/demo/common/commands/build", "make\n")
-        self.assertNotEqual(before, self.key())
-
-    def test_template_change_invalidates(self):
-        before = self.key()
-        self.repo.write(".github/templates/action.template.yml", "name: changed\n")
-        self.assertNotEqual(before, self.key())
-
-    def test_renderer_change_invalidates(self):
-        before = self.key()
-        self.repo.write("scripts/render.py", "print('changed')\n")
-        self.assertNotEqual(before, self.key())
-
-    def test_toolchain_change_invalidates(self):
-        before = self.key()
-        self.repo.write("docker/toolchain.Dockerfile", "FROM debian:bookworm-slim\n")
-        self.assertNotEqual(before, self.key())
+    def test_template_fetch_command_change_invalidates(self):
+        self.assert_key_changes(
+            lambda: self.repo.insert_after_step_start("fetch upstream source", "echo probe-fetch")
+        )
 
     def test_image_id_invalidates(self):
         before = self.key(image_id="sha256:aaaa")
@@ -121,62 +174,123 @@ class BuildKeyTests(unittest.TestCase):
         before = self.key()
         self.assertNotEqual(before, self.key(extra="--publish-scope demo"))
 
+    # --- edits that cannot change the artifact keep the key ------------------
+
+    def test_template_input_change_keeps_the_key(self):
+        self.assert_key_holds(
+            lambda: self.repo.rewrite_template(
+                lambda text: text.replace(
+                    "  publish:\n",
+                    '  unused_probe:\n    description: "probe"\n  publish:\n',
+                    1,
+                )
+            )
+        )
+
+    def test_template_guard_change_keeps_the_key(self):
+        # The step still runs the same commands; only *when* it runs changed.
+        def mutate(text: str) -> str:
+            return text.replace(
+                "    - name: fetch upstream source\n",
+                "    - name: fetch upstream source\n      if: inputs.reuse != 'true'\n",
+                1,
+            )
+
+        self.assert_key_holds(lambda: self.repo.rewrite_template(mutate))
+
+    def test_template_comment_change_keeps_the_key(self):
+        self.assert_key_holds(
+            lambda: self.repo.rewrite_template(lambda text: text.replace("# 3/5 - build", "# 3/5 - build (probe)"))
+        )
+
+    def test_template_test_step_change_keeps_the_key(self):
+        self.assert_key_holds(
+            lambda: self.repo.insert_after_step_start("test", "echo probe-test")
+        )
+
+    def test_template_publish_step_change_keeps_the_key(self):
+        self.repo.write(
+            "packages/demo/1.0.0/.stat",
+            STAT.replace("registry: https://example.invalid", "registry: https://other.invalid"),
+        )
+        before = self.key()
+        self.repo.write(
+            "packages/demo/1.0.0/.stat",
+            STAT.replace("registry: https://other.invalid", "registry: https://third.invalid"),
+        )
+        self.assertEqual(before, self.key())
+
+    def test_recipe_test_snippet_change_keeps_the_key(self):
+        self.assert_key_holds(
+            lambda: self.repo.write("packages/demo/1.0.0/commands/test", "echo other probe\n")
+        )
+
+    def test_renderer_and_toolchain_files_keep_the_key(self):
+        before = self.key()
+        # The key tracks the rendered commands, so an edit that does not change them
+        # cannot move it; the image id carries the toolchain.
+        self.repo.write("scripts/render.py", "print('changed')\n")
+        self.repo.write("docker/toolchain.Dockerfile", "FROM debian:bookworm-slim\n")
+        self.assertEqual(before, self.key())
+
     def test_other_recipe_does_not_invalidate(self):
         before = self.key()
         self.repo.recipe("other", name="@demo/other")
         self.assertEqual(before, self.key())
-
-    def test_missing_recipe_is_an_error(self):
-        with self.assertRaises(build_key.rl.RecipeError):
-            self.key(pkg="absent")
-
-    def test_inputs_are_sorted_and_cover_the_shared_files(self):
-        inputs = [
-            path.relative_to(self.repo.root).as_posix()
-            for path in build_key.collect_inputs(self.repo.root, "demo", "1.0.0")
-        ]
-        self.assertEqual(inputs, sorted(inputs))
-        self.assertIn("packages/demo/1.0.0/commands/build", inputs)
-        self.assertIn(".github/templates/action.template.yml", inputs)
-        self.assertIn("scripts/render.py", inputs)
-        self.assertIn("docker/toolchain.Dockerfile", inputs)
 
     def test_pycache_is_ignored(self):
         before = self.key()
         self.repo.write("scripts/__pycache__/render.cpython-314.pyc", "junk")
         self.assertEqual(before, self.key())
 
+    # --- shape and CLI -------------------------------------------------------
+
+    def test_inputs_are_the_rendered_build_steps(self):
+        parts = build_key.build_inputs(self.repo.root, "demo", "1.0.0")
+        joined = "\n".join(parts)
+        self.assertIn("npm install --ignore-scripts", joined)
+        self.assertIn("fetch", joined.lower())
+        self.assertNotIn("file build/Release/*.node", joined)
+
+    def test_missing_recipe_is_an_error(self):
+        with self.assertRaises(build_key.rl.RecipeError):
+            self.key(pkg="absent")
+
     def test_cli_prints_a_key(self):
-        self.assertEqual(build_key.main([
-            "--pkg", "demo",
-            "--ver", "1.0.0",
-            "--root", str(self.repo.root),
-        ]), 0)
+        self.assertEqual(
+            build_key.main(["--pkg", "demo", "--ver", "1.0.0", "--root", str(self.repo.root)]),
+            0,
+        )
 
     def test_cli_reports_a_missing_recipe(self):
-        self.assertEqual(build_key.main([
-            "--pkg", "absent",
-            "--ver", "1.0.0",
-            "--root", str(self.repo.root),
-        ]), 1)
+        self.assertEqual(
+            build_key.main(["--pkg", "absent", "--ver", "1.0.0", "--root", str(self.repo.root)]),
+            1,
+        )
 
 
 class RealRepositoryKeyTests(unittest.TestCase):
-    """The key of the shipped recipe must track the real files."""
+    """The keys of the shipped recipes must track their build inputs."""
 
-    def test_bufferutil_key_is_stable(self):
-        first = build_key.build_key(REPO_ROOT, "@ruyisdk/bufferutil", "4.2.0")
-        second = build_key.build_key(REPO_ROOT, "@ruyisdk/bufferutil", "4.2.0")
-        self.assertEqual(first, second)
+    def test_keys_are_stable_for_every_recipe(self):
+        for pkg, ver in (("@ruyisdk/bufferutil", "4.2.0"), ("@ruyisdk/utf-8-validate", "6.0.6")):
+            with self.subTest(pkg=pkg):
+                self.assertEqual(
+                    build_key.build_key(REPO_ROOT, pkg, ver),
+                    build_key.build_key(REPO_ROOT, pkg, ver),
+                )
 
-    def test_bufferutil_inputs_include_the_recipe(self):
-        inputs = [
-            path.relative_to(REPO_ROOT).as_posix()
-            for path in build_key.collect_inputs(REPO_ROOT, "@ruyisdk/bufferutil", "4.2.0")
-        ]
-        self.assertIn("packages/@ruyisdk/bufferutil/4.2.0/.stat", inputs)
-        self.assertIn("packages/@ruyisdk/bufferutil/4.2.0/commands/build", inputs)
-        self.assertIn(".github/templates/action.template.yml", inputs)
+    def test_recipes_have_distinct_keys(self):
+        self.assertNotEqual(
+            build_key.build_key(REPO_ROOT, "@ruyisdk/bufferutil", "4.2.0"),
+            build_key.build_key(REPO_ROOT, "@ruyisdk/utf-8-validate", "6.0.6"),
+        )
+
+    def test_recipe_build_snippet_is_part_of_the_inputs(self):
+        joined = "\n".join(
+            build_key.build_inputs(REPO_ROOT, "@ruyisdk/bufferutil", "4.2.0")
+        )
+        self.assertIn("node-gyp rebuild", joined)
 
 
 if __name__ == "__main__":
