@@ -206,6 +206,11 @@ Two images can therefore be involved in one job: `RISCV_IMAGE` is the build imag
 and `RISCV_TEST_IMAGE` the test image (unset ⇒ the same image). The cross image is
 pulled only by the cross recipes that need it.
 
+Every published image is single-platform, so pulls name the platform
+(`docker pull --platform linux/riscv64`); without it the daemon asks for the host
+platform and fails with `no matching manifest for linux/amd64`. The action does that
+in its prepare step and `build.yml` before it, so a recipe never has to care.
+
 Template features:
 
 * `{{key}}` substitution, indentation aware: a multi-line value gets the current

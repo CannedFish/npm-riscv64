@@ -93,9 +93,12 @@ jobs:
           if [ "${TOOLCHAIN:-native}" = "cross" ]; then
             echo "RISCV_IMAGE=$cross_image" >> "$GITHUB_ENV"
             echo "RISCV_TEST_IMAGE=$native_image" >> "$GITHUB_ENV"
+            echo "RISCV_IMAGE_PLATFORM=linux/amd64" >> "$GITHUB_ENV"
+            echo "RISCV_TEST_IMAGE_PLATFORM=linux/riscv64" >> "$GITHUB_ENV"
             echo "toolchain: cross (build $cross_image, test $native_image)"
           else
             echo "RISCV_IMAGE=$native_image" >> "$GITHUB_ENV"
+            echo "RISCV_IMAGE_PLATFORM=linux/riscv64" >> "$GITHUB_ENV"
             echo "toolchain: native ($native_image)"
           fi
 
@@ -119,18 +122,26 @@ jobs:
       - name: Pull toolchain images
         run: |
           set -euo pipefail
-          for image in "$RISCV_IMAGE" "${RISCV_TEST_IMAGE:-}"; do
-            [ -n "$image" ] || continue
-            echo "pulling $image"
-            if ! docker pull "$image"; then
-              echo "ERROR: cannot pull $image" >&2
+          # The images are published per platform (riscv64 for native builds, amd64
+          # for the cross toolchain), so a pull must name the platform it wants:
+          # without it the daemon asks for the runner platform and the registry
+          # answers "no matching manifest for linux/amd64 in the manifest list
+          # entries" for a riscv64-only image.
+          pull_image() {
+            local image="$1" platform="$2"
+            [ -n "$image" ] || return 0
+            echo "pulling $image ($platform)"
+            if ! docker pull --platform "$platform" "$image"; then
+              echo "ERROR: cannot pull $image ($platform)" >&2
               echo "  public package  -> anonymous pull should work; check the tag exists" >&2
               echo "  private package -> connect the package to this repository, or add a" >&2
               echo "                     token with read:packages as the GHCR_TOKEN secret" >&2
               exit 1
             fi
             docker image inspect "$image" --format "image id: $image {{.Id}}"
-          done
+          }
+          pull_image "$RISCV_IMAGE" "${RISCV_IMAGE_PLATFORM:-linux/riscv64}"
+          pull_image "${RISCV_TEST_IMAGE:-}" "${RISCV_TEST_IMAGE_PLATFORM:-linux/riscv64}"
 
       # Artifact reuse (D16). The key covers every input that can change the built
       # artifact - recipe, common layer, template, renderer, toolchain, image - so a

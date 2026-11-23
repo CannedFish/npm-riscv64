@@ -43,19 +43,26 @@ runs:
         test_image="${RISCV_TEST_IMAGE:-${RISCV_IMAGE:-{{test.image}}}}"
         echo "build image: $image ({{build.platform}}) via {{job.toolchain}} toolchain"
         echo "test image: $test_image ({{test.platform}})"
-        for one in "$image" "$test_image"; do
+        # Each image exists for exactly one platform, so a pull has to name it:
+        # without --platform the daemon asks for the platform of the host, and the
+        # registry answers "no matching manifest for linux/amd64 in the manifest
+        # list entries" for a riscv64-only image.
+        pull_image() {
+          local platform="$1" one="$2"
           if docker image inspect "$one" >/dev/null 2>&1; then
-            continue
+            return 0
           fi
-          echo "image not present locally, pulling $one"
-          if ! docker pull "$one"; then
-            echo "ERROR: cannot pull $one" >&2
+          echo "image not present locally, pulling $one ($platform)"
+          if ! docker pull --platform "$platform" "$one"; then
+            echo "ERROR: cannot pull $one ($platform)" >&2
             echo "Set RISCV_IMAGE / RISCV_TEST_IMAGE to reachable images (see the" >&2
             echo "toolchain-image workflow), or build them locally:" >&2
             echo "  docker build -f {{build.dockerfile}} -t {{build.image}} ." >&2
-            exit 1
+            return 1
           fi
-        done
+        }
+        pull_image "{{build.platform}}" "$image"
+        pull_image "{{test.platform}}" "$test_image"
         mkdir -p "$GITHUB_WORKSPACE/.container-home"
         docker run --rm --platform {{build.platform}} "$image" uname -m
 {{#if job.cross}}

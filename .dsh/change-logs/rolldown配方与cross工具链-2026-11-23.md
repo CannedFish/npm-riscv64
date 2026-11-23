@@ -69,3 +69,24 @@ verdaccio 演练需要把 `max_body_size` 抬到 100mb（默认 10mb 会 413，�
 
 cross 镜像没有 riscv64 的系统 C 库与头文件：若某个包除 Rust 外还链接 riscv64 系统库，要么回 native，
 要么给镜像加 `dpkg --add-architecture riscv64` 与对应 `-dev` 包。本轮 rolldown 只需交叉 gcc 做链接。
+
+## 8. 拉取镜像报 `no matching manifest for linux/amd64`
+
+镜像推成功了，但 `build.yml` 拉 `:riscv64` 时报：
+
+```
+Error response from daemon: no matching manifest for linux/amd64 in the manifest list entries
+```
+
+原因：`buildx build --platform linux/riscv64` 推上去的是**只含 riscv64 的 manifest list**。
+`docker pull` 不给 `--platform` 时按**宿主平台**（runner 是 amd64）去要，索引里没有就报错。交叉镜像
+（amd64）在 amd64 runner 上刚好命中，所以只有 riscv64 那个失败。
+
+改法：`build.yml` 的 Resolve 步骤额外导出 `RISCV_IMAGE_PLATFORM` / `RISCV_TEST_IMAGE_PLATFORM`
+（native → `linux/riscv64`；cross → build `linux/amd64` / test `linux/riscv64`），
+Pull 步骤与模板的 prepare 步骤都改成 `docker pull --platform <platform>`（`docker image inspect`
+命中本地镜像时跳过拉取）。L0 增加断言，防止有人把 `--platform` 从 pull 上拿掉。
+
+顺带确认：`docker build` 那条 `FromPlatformFlagConstDisallowed` 警告是**故意保留**的——两个
+Dockerfile 各自只服务一个平台，写死 `FROM --platform` 能让「在错误平台上构建」直接失败，而不是悄悄
+产出一个架构不对却挂着 riscv64 名字的镜像。

@@ -135,6 +135,12 @@ For a private package, either connect the package to the repository or add a tok
 with `read:packages` as `GHCR_TOKEN`. Locally, L1 works the same way: it uses the
 local tag if present and pulls `RISCV_IMAGE` when it is missing.
 
+Each tag holds one platform only, so a pull has to name it:
+`docker pull --platform linux/riscv64 <image>:riscv64`. Without `--platform` the
+daemon asks for the platform of the host and the registry answers
+`no matching manifest for linux/amd64 in the manifest list entries`. The action and
+`build.yml` do this for you; it only matters when you pull by hand.
+
 Pushing the images is a permission question about the **package**, not about the
 workflow: `packages: write` is not enough when the package is not linked to the
 repository. A package that was first pushed by hand with a personal token stays

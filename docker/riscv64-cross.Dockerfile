@@ -11,6 +11,9 @@
 #
 # The base image is the same Debian release as the riscv64 image, so glibc and
 # the C library ABI line up with the runtime the test step uses.
+# amd64 is also the default platform, but it is written out for the same reason as
+# the riscv64 image: a mis-typed build should fail loudly instead of producing an
+# image for the wrong architecture under a name that promises otherwise.
 FROM --platform=linux/amd64 debian:trixie-slim
 
 ENV DEBIAN_FRONTEND=noninteractive

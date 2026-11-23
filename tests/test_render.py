@@ -268,8 +268,13 @@ class RecipeTests(unittest.TestCase):
         for name in ("fetch upstream source", "build", "test"):
             self.assertIn("--platform linux/riscv64", steps[name], name)
             self.assertIn("npm-riscv64/toolchain:riscv64", steps[name], name)
-        self.assertNotIn("linux/amd64", rendered)
+        # No *executed* amd64 platform anywhere (a comment may name it).
+        self.assertNotIn("--platform linux/amd64", rendered)
+        self.assertNotIn('pull_image "linux/amd64"', rendered)
         self.assertNotIn("riscv64-linux-gnu-gcc", rendered)
+        # Both images of a native recipe are the riscv64 one, pulled by platform.
+        self.assertIn('pull_image "linux/riscv64" "$image"', steps["prepare toolchain"])
+        self.assertIn('pull_image "linux/riscv64" "$test_image"', steps["prepare toolchain"])
         self.assertNotIn("RISCV_TARGET", rendered)
 
     def test_cross_recipe_builds_on_amd64_and_tests_on_riscv64(self):
@@ -292,6 +297,10 @@ class RecipeTests(unittest.TestCase):
         # The prepare step proves the cross toolchain works before anything else runs.
         self.assertIn("riscv64-linux-gnu-gcc --version", steps["prepare toolchain"])
         self.assertIn("docker/riscv64-cross.Dockerfile", steps["prepare toolchain"])
+        # Each published image is single-platform, so a pull that does not name the
+        # platform fails on the runner with "no matching manifest for linux/amd64".
+        self.assertIn('pull_image "linux/amd64" "$image"', steps["prepare toolchain"])
+        self.assertIn('pull_image "linux/riscv64" "$test_image"', steps["prepare toolchain"])
 
     def test_cross_patch_step_runs_on_the_build_platform(self):
         # Patches are applied with git inside the build container; they are not
