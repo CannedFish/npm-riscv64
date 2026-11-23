@@ -659,8 +659,13 @@ class PublishAuthTests(unittest.TestCase):
 
     def test_basic_auth_writes_the_auth_line_keyed_by_the_full_url(self):
         script = self._publish([self._entry(auth="basic")])
-        self.assertIn('setup_auth "https://registry.example.net/repository/npm-local" '
+        # The registry is normalized to end with a slash: npm derives the credential
+        # key from new URL(".", registryUrl), so without it npm drops the last path
+        # segment and refuses with ENEEDAUTH before sending anything.
+        self.assertIn('setup_auth "https://registry.example.net/repository/npm-local/" '
                       '"NODE_AUTH_TOKEN" "basic"', script)
+        self.assertIn('publish_one "." "demo" "1.0.0" '
+                      '"https://registry.example.net/repository/npm-local/"', script)
         self.assertIn('_auth=${%s}', script)
         self.assertIn('//host/repository/name/', script)  # explains the key shape
         self.assertIn('dart="${registry#*://}"', script)
@@ -676,6 +681,18 @@ class PublishAuthTests(unittest.TestCase):
         }
         problems = rl.validate_stat(target, recipe)
         self.assertTrue(any("auth 'bearer'" in problem for problem in problems))
+
+    def test_registry_url_is_normalized_to_a_directory(self):
+        self.assertEqual(
+            render.normalize_registry("https://host.example.net/repository/npm-local"),
+            "https://host.example.net/repository/npm-local/",
+        )
+        self.assertEqual(
+            render.normalize_registry("https://host.example.net/repository/npm-local/"),
+            "https://host.example.net/repository/npm-local/",
+        )
+        self.assertEqual(render.normalize_registry("https://registry.npmjs.org"),
+                         "https://registry.npmjs.org/")
 
     def test_idempotency_trusts_the_registry_answer_not_a_lookup(self):
         script = self._publish([self._entry()])

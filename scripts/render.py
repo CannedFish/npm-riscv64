@@ -38,6 +38,23 @@ CONDITION_OPEN = re.compile(r"^\s*\{\{\s*#(if|unless)\s+([A-Za-z0-9_.\-]+)\s*\}\
 CONDITION_CLOSE = re.compile(r"^\s*\{\{\s*/(if|unless)\s*\}\}\s*$")
 
 DEFAULT_TEMPLATE = ".github/templates/action.template.yml"
+
+
+def normalize_registry(registry: str) -> str:
+    """Return the registry URL in the form npm expects.
+
+    npm derives the key it looks credentials up by from ``new URL('.', registryURL)``
+    (see @npmcli/config nerf-dart): the URL is treated as a *file* name, so a URL
+    without a trailing slash makes npm drop the last path segment. Publishing to
+    ``https://host/repository/npm-local`` would therefore look for credentials of
+    ``//host/repository/``, never match a ``//host/repository/npm-local/:_auth``
+    line, and fail with ENEEDAUTH before a single byte is sent. Ending the URL with
+    a slash keeps the key and the request URL in agreement.
+    """
+    value = registry.strip()
+    if not value:
+        return value
+    return value if value.endswith("/") else value + "/"
 DEFAULT_ROOT = "packages"
 SRC_DIR = "src"
 
@@ -521,7 +538,9 @@ def generate_publish(stat: dict, target: rl.Target, artifact_glob: str) -> str:
 
     seen_auth: set[tuple[str, str]] = set()
     for entry in entries:
-        registry = str(entry.get("registry") or "https://registry.npmjs.org")
+        registry = normalize_registry(
+            str(entry.get("registry") or "https://registry.npmjs.org")
+        )
         token_env = str(entry.get("token_env") or "")
         auth_kind = str(entry.get("auth") or rl.PUBLISH_AUTH_TOKEN)
         key = (registry, token_env, auth_kind)
@@ -539,7 +558,9 @@ def generate_publish(stat: dict, target: rl.Target, artifact_glob: str) -> str:
         dir_value = str(entry.get("dir", "."))
         name = str(entry.get("name", ""))
         version = str(entry.get("version", ""))
-        registry = str(entry.get("registry") or "https://registry.npmjs.org")
+        registry = normalize_registry(
+            str(entry.get("registry") or "https://registry.npmjs.org")
+        )
         mode = "generate" if entry.get("generate_manifest") else "verify"
         requires = [str(d) for d in (entry.get("requires") or [])]
         req_name = requires[0] if requires else ""

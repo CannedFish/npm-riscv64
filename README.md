@@ -172,7 +172,10 @@ Basic, not an npm bearer token. Each `.stat` says how to send it:
 ```
 
 `token_env` names the **environment variable**, not the secret: the publish step reads
-`$NODE_AUTH_TOKEN` and writes the matching line into a throwaway `.npmrc`
+`$NODE_AUTH_TOKEN`, normalizes the registry URL to end with `/` (npm derives its
+credential key from `new URL(".", registryUrl)`, so a missing slash makes npm look one
+path segment higher and fail with `ENEEDAUTH` before sending anything), and writes the
+matching line into a throwaway `.npmrc`
 (`//forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/:_auth=...`, keyed by
 the full registry URL, path included). To get a credential, log in to the registry UI
 with your account and take the base64 form:

@@ -144,10 +144,10 @@ console.log("[publish] wrote " + file + " (" + mode + ")");
 }
 
 # Credentials first: publishing may need auth before it can answer.
-setup_auth "https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local" "NODE_AUTH_TOKEN" "basic"
+setup_auth "https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/" "NODE_AUTH_TOKEN" "basic"
 
 # Publish order: native/binary packages first, then the JS package that
 # references them through optionalDependencies.
-publish_one "." "bufferutil" "4.2.0" "https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local" "generate" "" "" "" ""
+publish_one "." "bufferutil" "4.2.0" "https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/" "generate" "" "" "" ""
 
 log "publish finished for bufferutil@4.2.0"
