@@ -23,8 +23,11 @@ packages/
 
 Rules:
 
-* A directory under `packages/` is a **package**; scoped names use the npm form
-  (`@scope/name`) and therefore occupy two path segments.
+* A directory under `packages/` is a **package**, named after the package as it is
+  *published upstream*: `packages/bufferutil/4.2.0` for the unscoped `bufferutil`,
+  `packages/@scope/name/1.2.3` for a scoped one (two path segments). The path is the
+  identity of the recipe, so it never carries a registry or a re-brand - that is what
+  `npm_publish[].name` is for.
 * Every directory inside a package - except `common` - is a **version** and must
   contain `.stat`. The set of version directories *is* the set of buildable
   recipes; a version directory without `.stat` is an error, not a draft.
@@ -63,11 +66,15 @@ artifacts:
 
 npm_publish:
   - role: main           # main | binary
-    name: "@ruyisdk/example"
+    # The name to publish under, i.e. what a consumer types. Keeping the upstream
+    # name (and scope) makes `npm i <pkg>` transparent; a fork that must re-brand
+    # says so here, or passes --publish-scope at render time.
+    name: example
     version: 1.0.0
     dir: .               # directory to publish, relative to the source root
-    registry: https://npm.pkg.github.com
-    token_env: NODE_AUTH_TOKEN
+    registry: https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local
+    token_env: NODE_AUTH_TOKEN   # env var holding the credential (see §6)
+    auth: basic          # token | basic
     generate_manifest: true
 ```
 
@@ -153,9 +160,19 @@ For every entry:
    | generate | `generate_manifest: true` | create the manifest when it is missing, update it when it exists: `name` and `version` come from `.stat`, every other field is preserved |
    | verify | `generate_manifest` absent/false | the manifest must exist and its `name`/`version` must match `.stat`; a mismatch is a hard failure |
 
-3. idempotency: `npm view <name>@<version>` - already present means "skip";
-4. credentials: `token_env` names an environment variable; when it is set, a
-   `//<host>/:_authToken=${TOKEN_ENV}` line is written to a throwaway `.npmrc`,
+3. idempotency: `npm publish` runs, and the registry answer decides. A "this
+   version already exists" refusal (409 / `EPUBLISHCONFLICT` / "cannot publish
+   over") is logged as a skip so a rerun stays green; anything else fails. A plain
+   `npm view <name>@<version>` lookup is deliberately not used: a registry that
+   proxies or groups another one serves upstream versions of the same name, so the
+   lookup reports our own package as published and the publish silently never
+   happens (witnessed with verdaccio and `bufferutil@4.2.0`);
+4. credentials: `token_env` names an environment variable; when it is set, a line
+   keyed by the **full registry URL** (path included, npm looks credentials up by the
+   URL it talks to) is written to a throwaway `.npmrc`:
+   `//<host>/<path>/:_authToken=${TOKEN_ENV}` for `auth: token` (the default), or
+   `//<host>/<path>/:_auth=${TOKEN_ENV}` for `auth: basic`, which is what a registry
+   answering `WWW-Authenticate: Basic` expects (the value is base64 `user:password`).
    before the idempotency probe (a private registry needs auth even to answer it);
 5. `npm publish <dir> --registry <registry> --access public --ignore-scripts`.
 
@@ -177,7 +194,7 @@ needs `max_body_size: 100mb` in its config.
 ## 7. What the renderer generates
 
 ```bash
-python3 scripts/render.py --pkg @ruyisdk/bufferutil --ver 4.2.0 --out-dir .rendered/action
+python3 scripts/render.py --pkg bufferutil --ver 4.2.0 --out-dir .rendered/action
 python3 scripts/render.py --check-all          # every recipe, YAML validated
 python3 scripts/render.py --pkg … --ver … --out .rendered/action/action.yml
 ```
@@ -338,7 +355,7 @@ to a full build.
 | level | command | what it proves |
 | --- | --- | --- |
 | L0 | `python3 -m unittest discover -s tests` | renderer, layering, detection, generated YAML validity, golden snapshot (`tests/golden/`, refresh with `python3 tests/regen_golden.py`) |
-| L1 | `python3 tests/run_action_locally.py --pkg @ruyisdk/bufferutil --ver 4.2.0` | the rendered action really fetches, builds and tests under riscv64 emulation |
+| L1 | `python3 tests/run_action_locally.py --pkg bufferutil --ver 4.2.0` | the rendered action really fetches, builds and tests under riscv64 emulation |
 | L2 | `python3 tests/l2_publish.py` | publish order, idempotency, manifest merge, identity, partial-failure re-entry against verdaccio |
 
 L1 and L2 need docker. L1 uses the toolchain images: `--image` (or `RISCV_IMAGE`)
@@ -348,13 +365,14 @@ cross recipe is reproduced the way CI runs it - e.g.
 ```bash
 RISCV_IMAGE=npm-riscv64/toolchain:cross \
 RISCV_TEST_IMAGE=npm-riscv64/toolchain:riscv64 \
-python3 tests/run_action_locally.py --pkg @ruyisdk/rolldown --ver 1.3.3
+python3 tests/run_action_locally.py --pkg rolldown --ver 1.3.3
 ```
 
 It takes a local image when one exists and otherwise pulls it. In CI the image is published once
 by the `toolchain-image` workflow and pulled per run - building it per run costs
 minutes of emulated package installs and can silently succeed without producing a
 local image. Set `RISCV_IMAGE` to override the image and `NPM_REGISTRY` to point
-publishing at a local registry. L3 (real GitHub Actions) runs in a fork; there GitHub Packages
-requires the npm scope to match the repository owner, which `--override` covers
-without touching the recipes.
+publishing at a local registry. L3 (real GitHub Actions) runs in a fork; there the
+registry and its credential are the ones the `.stat` names, and `--override` (or the
+`PUBLISH_REGISTRY` / `PUBLISH_SCOPE` variables) moves a build elsewhere without
+touching the recipes.

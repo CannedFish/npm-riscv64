@@ -39,7 +39,7 @@ packages/<pkg>/<version>/.stat      recipe: source, patches, build/test commands
 python3 scripts/render.py --check-all
 
 # render one recipe into an action plus its step scripts
-python3 scripts/render.py --pkg @ruyisdk/bufferutil --ver 4.2.0 --out-dir .rendered/action
+python3 scripts/render.py --pkg bufferutil --ver 4.2.0 --out-dir .rendered/action
 
 # what would CI build for the current change?
 EVENT_NAME=pull_request BASE_REF=main python3 scripts/detect_targets.py
@@ -69,7 +69,7 @@ test fails, read the diff - when the change is intended, refresh the snapshot wi
 | level | command | covers |
 | --- | --- | --- |
 | L0 | `python3 -m unittest discover -s tests` | renderer, layering, change detection, rendered YAML validity, golden snapshot of the reference recipe |
-| L1 | `python3 tests/run_action_locally.py --pkg @ruyisdk/bufferutil --ver 4.2.0` | the rendered action actually fetches, builds and tests under riscv64 emulation |
+| L1 | `python3 tests/run_action_locally.py --pkg bufferutil --ver 4.2.0` | the rendered action actually fetches, builds and tests under riscv64 emulation |
 | L2 | `python3 tests/l2_publish.py` | publish order A→B, idempotency, manifest merge, name identity, partial-failure re-entry (verdaccio) |
 | L3 | GitHub Actions in a fork | emulated qemu, artifact reuse, real registry publishing |
 
@@ -155,19 +155,64 @@ unlinked, and the workflow token then keeps read-only access - the push fails wi
 
 ## Running it in a fork
 
-Publishing to GitHub Packages requires the npm scope to equal the repository owner,
-so a fork does not publish `@ruyisdk/*`. Set repository variables instead of editing
-recipes:
+## Publishing
+
+The recipes publish to `https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local`
+under the **upstream names**, unscoped (`bufferutil`, `utf-8-validate`, `rolldown`).
+That naming is deliberate: a consumer whose npm resolves those names from a registry
+carrying these recipes gets riscv64 support without renaming a single import.
+
+The registry answers `401` with `WWW-Authenticate: Basic`, so the credential is HTTP
+Basic, not an npm bearer token. Each `.stat` says how to send it:
+
+```yaml
+    registry: https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local
+    token_env: NODE_AUTH_TOKEN
+    auth: basic        # token -> "_authToken", basic -> "_auth" (base64 user:password)
+```
+
+`token_env` names the **environment variable**, not the secret: the publish step reads
+`$NODE_AUTH_TOKEN` and writes the matching line into a throwaway `.npmrc`
+(`//forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/:_auth=...`, keyed by
+the full registry URL, path included). To get a credential, log in to the registry UI
+with your account and take the base64 form:
+
+```bash
+printf '%s' 'user:password' | base64        # macOS: base64 | tr -d '\n'
+gh secret set NPM_PUBLISH_TOKEN --repo <owner>/npm-riscv64   # paste the base64 value
+```
+
+The workflow maps `secrets.NPM_PUBLISH_TOKEN` to `NODE_AUTH_TOKEN` for the action, so
+adding that secret is the only setup a fork needs. A recipe pointed at a bearer-token
+registry (GitHub Packages, Nexus npm tokens) uses `auth: token` instead and the secret
+holds the token verbatim.
+
+Repository variables override the recipes at render time, so a fork can publish
+somewhere else without editing them:
 
 | variable | value | effect |
 | --- | --- | --- |
-| `PUBLISH_SCOPE` | `cannedfish` | rewrites every publish target to `@cannedfish/...` (references included) |
+| `PUBLISH_SCOPE` | `ruyirepo` | rewrites every publish target to `@ruyirepo/...` (references included) |
 | `PUBLISH_REGISTRY` | `https://npm.pkg.github.com` | points every publish target at that registry |
 | `SKIP_PUBLISH` | `true` | keeps the build running but skips publishing |
 
-```bash
-gh variable set PUBLISH_SCOPE --body cannedfish --repo <owner>/npm-riscv64
-```
+A scope is only needed when the target registry demands one - GitHub Packages
+requires it to equal the repository owner. Otherwise the unscoped upstream name is the
+better default: it keeps `npm i rolldown` meaning what it always meant.
+
+Two consequences of publishing under the upstream name, both worth knowing before a
+consumer tries it:
+
+* the registry must be the one the consumer resolves that name from. `npm-rv-test-local`
+  is a hosted repository, so it carries only the packages published into it; a consumer
+  pointing npm straight at it gets `404` for every ordinary dependency. Put it in a
+  group/virtual repository together with a proxy to npmjs, or map the scope of each
+  dependency to npmjs in the consumer's `.npmrc`.
+* a version that also exists upstream looks identical to a proxying registry. Hosted
+  members win in a group repository, so consumers get the riscv64 build - but a
+  `latest` that upstream has already moved past resolves to the binding-less upstream
+  package, and publishing the same version again is refused by the registry as
+  "already exists" (the publish step logs that as a skip).
 
 Pull requests only build and test; merging to `main` is the approval gate that also
 publishes. If publishing fails, the artifact is still there - the four build steps run
@@ -176,7 +221,8 @@ before it.
 ## Layout
 
 ```
-packages/<pkg>/<version>/   recipes (.stat, commands/, patches/)
+packages/<pkg>/<version>/   recipes (.stat, commands/, patches/); <pkg> is the npm
+                            name as published upstream (unscoped when upstream is)
 docker/                     riscv64 toolchain image
 scripts/                    renderer, change detector, recipe helpers
 .github/templates/          the composite action template

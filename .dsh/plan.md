@@ -851,3 +851,51 @@ rolldown 自己来打包自己（自举）；而 `@oxc-node/core` 的 16 个平�
 **已知限制**：cross 镜像里没有 riscv64 的 C 库/头文件，所以「Rust 之外还依赖系统 C 库」的包不能走
 cross（要么回到 native，要么给镜像加 `dpkg --add-architecture riscv64` 与对应 `-dev` 包）；本轮
 rolldown 只需要交叉 gcc 做链接，不涉及该限制。
+
+---
+
+## 14. 2026-11-23 第二轮：配方命名、发布仓库与幂等判定（D27–D29）
+
+### D27 配方路径与发布名
+
+* 路径写 `packages/<npm 名>/<version>`，`<npm 名>` = **上游发布时用的名字**：三个包都
+  unscoped（`bufferutil` / `utf-8-validate` / `rolldown`），因此从 `packages/@ruyisdk/...` 移回
+  `packages/bufferutil/...`。scoped 包才占两段路径（`packages/@scope/name/1.2.3`）。
+* 路径是**配方的身份**，不该承载「发到哪个仓库、挂在谁的 scope 下」——那是 `npm_publish[].name`
+  的事。
+* 发布名**沿用上游名**（不加 scope）：`npm i rolldown` / `npm i bufferutil` 才有机会被透明替换成
+  riscv64 版本。若目标仓库强制要求 scope，用 **`@ruyirepo`**（`--publish-scope ruyirepo` 或仓库变量
+  `PUBLISH_SCOPE`），不再用 `@ruyisdk`——那是上游组织名下的 scope，我们无权发布。
+* 历史记录（§13.1 / §13.10 / §13.12）保留当时的 `@ruyisdk/*` 字样，它们是**当时的事实**。
+
+### D28 发布仓库与凭据
+
+* 目标仓库：`https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local`。
+* 该仓库对未认证请求回 `401` 且带 `WWW-Authenticate: Basic realm="ForgeStash platform"`——要的是
+  **HTTP Basic**，不是 npm bearer token。因此 `.stat` 新增 `npm_publish[].auth`：`token`（默认，写
+  `_authToken`）| `basic`（写 `_auth`，值为 base64 `user:password`）。三个配方都用 `basic`。
+* 授权行按**完整 registry URL**（含路径）作 key 写入一次性 `.npmrc`（`//host/<path>/:_auth=...`）：
+  npm 是按「它正在访问的那个 URL」查凭据的，只写 host 对 `/repository/x/` 这类仓库并不可靠。
+* `token_env` 指**环境变量名**（沿用 npm 惯例的 `NODE_AUTH_TOKEN`），CI 里由 secret
+  `NPM_PUBLISH_TOKEN` 注入；本机演练用 `NODE_AUTH_TOKEN=$(cat .dsh/tmp/verdaccio-token)`。
+
+### D29 幂等判定：发完之后看注册中心回答
+
+* 原实现先 `npm view <name>@<version>` 再决定发不发。**同名策略下这条预检是错的**：只要仓库带
+  npmjs 上行/组仓库，`npm view bufferutil@4.2.0` 会命中上游同名版本 → 判定「已发布」→ 静默跳过。
+  本轮 verdaccio 演练就这样把 `bufferutil` 跳过了（日志里只有 `already published`，仓库里没有）。
+* 改为：直接 `npm publish`；若注册中心回 409 / `EPUBLISHCONFLICT` / "already exists" /
+  "previously published" / "cannot publish over" → 记一次 skip（重跑仍绿）；其它错误照常失败并打印。
+  判定权交给**目标仓库本身**：它才知道「这个版本在不在我这里」。
+
+### 本轮验证
+
+| 项 | 结果 |
+|---|---|
+| L0 | **99 用例通过**（新增 `PublishAuthTests`：auth 两档渲染、未知档拒绝、幂等不再依赖 `npm view`）；`--check-all` 3 配方 0 失败 |
+| 构建 key | `bufferutil` `bb563c29406f`、`utf-8-validate` `6416447a76d1`、`rolldown` `a8b66e70b5c1`——与改名**前**一致（目录名不参与 key，缓存树不用重建） |
+| L2 演练（verdaccio） | `[publish] published rolldown@1.3.3`、`[publish] published bufferutil@4.2.0`；重跑 → `already published: rolldown@1.3.3 (the registry refused a second publish; skipped)` 且 job 仍 OK |
+| 消费者（riscv64，指向本地仓库） | `npm i rolldown` → `added 3 packages`，`node_modules/rolldown/dist/shared/rolldown-binding.linux-riscv64-gnu.node`，`bundle ok, 5 lines, arch=riscv64` |
+| 消费者（riscv64，上游 npmjs 对照） | `npm i rolldown` → `added 3 packages`（16 个 optionalDependencies 全被 os/cpu 跳过），运行 → `Cannot find native binding`（退化到 wasm32-wasi 分支） |
+| 消费者（bufferutil） | `npm i bufferutil` → 解析到 `prebuilds/linux-riscv64/bufferutil.node`，`unmask` 往返一致（23 字节） |
+| 已知坑 | 原生 `mask` 是 5 参数（`source, mask, dest, offset, length`）、`unmask` 是 2 参数（就地还原）；用 2 参数调 `mask` 会触发上游 `assert` 崩溃——**是调用者的错，不是产物的错**（第一版自测就踩了） |

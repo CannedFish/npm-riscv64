@@ -14,7 +14,10 @@ on:
 permissions:
   contents: read
   actions: read    # find and download a previous build tree (artifact reuse)
-  packages: write # required to publish to GitHub Packages (npm.pkg.github.com)
+  # Publishing uses the registry credential in secrets.NPM_PUBLISH_TOKEN, not the
+  # workflow token. `packages: write` stays for forks that publish to GitHub
+  # Packages itself (PUBLISH_REGISTRY + PUBLISH_SCOPE == owner).
+  packages: write
 
 concurrency:
   group: build-${{ github.workflow }}-${{ github.ref }}
@@ -187,9 +190,10 @@ jobs:
       # The rendered action goes to a fixed path: every matrix job has its own
       # workspace, and `uses:` does not accept expressions.
       #
-      # PUBLISH_SCOPE / PUBLISH_REGISTRY are optional repository variables. A fork
-      # needs them because GitHub Packages only accepts packages whose npm scope
-      # equals the repository owner; the recipes themselves stay unchanged.
+      # PUBLISH_SCOPE / PUBLISH_REGISTRY are optional repository variables, for
+      # pointing a build at a different registry or scope than the recipe names
+      # (a GitHub Packages target needs PUBLISH_SCOPE == the repository owner).
+      # The recipes themselves stay unchanged.
       - name: Render composite action
         env:
           PUBLISH_SCOPE: ${{ vars.PUBLISH_SCOPE }}
@@ -220,7 +224,12 @@ jobs:
           publish: ${{ needs.detect.outputs.publish == 'true' && vars.SKIP_PUBLISH != 'true' }}
           reuse: ${{ steps.reuse.outputs.hit == 'true' }}
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The recipes read NODE_AUTH_TOKEN (npm's canonical variable) and say how
+          # to use it, so the secret only has to hold the credential. The test
+          # registry answers `WWW-Authenticate: Basic`, hence recipes set
+          # `auth: basic` and this value is base64 of "user:password". A recipe
+          # publishing to GitHub Packages reads it as a token instead.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
