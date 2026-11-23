@@ -35,6 +35,15 @@ TOOLCHAIN_CROSS = "cross"
 TOOLCHAIN_KINDS = (TOOLCHAIN_NATIVE, TOOLCHAIN_CROSS)
 DEFAULT_TOOLCHAIN = TOOLCHAIN_NATIVE
 
+# How the publish step authenticates to a registry. "token" writes an
+# ``_authToken`` line (npm bearer token, GitHub Packages, Nexus npm tokens);
+# "basic" writes ``_auth`` with the base64 of ``user:password``, which is what a
+# registry answering ``WWW-Authenticate: Basic`` expects.
+PUBLISH_AUTH_TOKEN = "token"
+PUBLISH_AUTH_BASIC = "basic"
+PUBLISH_AUTH_KINDS = (PUBLISH_AUTH_TOKEN, PUBLISH_AUTH_BASIC)
+DEFAULT_PUBLISH_AUTH = PUBLISH_AUTH_TOKEN
+
 #: Reference names that move and therefore cannot pin a source tree.
 MUTABLE_REFS = frozenset(
     {"main", "master", "develop", "dev", "head", "latest", "trunk", "next"}
@@ -294,6 +303,13 @@ def _validate_publish_entries(target: Target, publish: Iterable) -> list[str]:
             problems.append(f"{where}.dir is required (path inside the source tree)")
         if role == "binary" and not (entry.get("os") and entry.get("cpu")):
             problems.append(f"{where}: role=binary requires os and cpu")
+        auth = entry.get("auth")
+        if auth is not None and str(auth).strip().lower() not in PUBLISH_AUTH_KINDS:
+            problems.append(
+                f"{where}.auth '{auth}' is not supported; use one of "
+                f"{PUBLISH_AUTH_KINDS} (omit the field for "
+                f"'{DEFAULT_PUBLISH_AUTH}')"
+            )
 
     for index, entry in enumerate(publish):
         if not isinstance(entry, dict):

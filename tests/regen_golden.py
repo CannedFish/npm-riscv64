@@ -18,7 +18,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GOLDEN = REPO_ROOT / "tests/golden/bufferutil-4.2.0"
-PKG = "@ruyisdk/bufferutil"
+PKG = "bufferutil"
 VER = "4.2.0"
 STEPS_DIR = ".rendered/action"
 

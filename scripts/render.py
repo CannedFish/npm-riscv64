@@ -447,15 +447,26 @@ def generate_publish(stat: dict, target: rl.Target, artifact_glob: str) -> str:
         'log() { echo "[publish] $*"; }',
         "",
         "setup_auth() {",
-        '  local registry="$1" token_env="$2"',
+        '  local registry="$1" token_env="$2" auth_kind="$3"',
         '  [ -n "$token_env" ] || return 0',
         '  if [ -z "${!token_env:-}" ]; then',
-        '    log "no token in $token_env; talking to $registry unauthenticated"',
+        '    log "no credential in $token_env; talking to $registry unauthenticated"',
         "    return 0",
         "  fi",
-        '  local host="${registry#*://}"; host="${host%%/*}"',
-        "  printf '//%s/:_authToken=${%s}\\n' \"$host\" \"$token_env\" >> \"$NPM_CONFIG_USERCONFIG\"",
-        '  log "auth configured for $host via $token_env"',
+        "  # npm looks credentials up by the registry URL it talks to, path included:",
+        '  # "//host/repository/name/" is the key for a registry at .../repository/name/.',
+        '  local dart="${registry#*://}"',
+        '  dart="${dart%%\\?*}"',
+        '  dart="//$dart"',
+        '  [ "${dart: -1}" = "/" ] || dart="$dart/"',
+        '  if [ "$auth_kind" = "basic" ]; then',
+        "    # Basic credentials: base64 of user:password, as the registry asks for it",
+        "    # (WWW-Authenticate: Basic).",
+        "    printf '%s:_auth=${%s}\\n' \"$dart\" \"$token_env\" >> \"$NPM_CONFIG_USERCONFIG\"",
+        "  else",
+        "    printf '%s:_authToken=${%s}\\n' \"$dart\" \"$token_env\" >> \"$NPM_CONFIG_USERCONFIG\"",
+        "  fi",
+        '  log "auth configured for $dart via $token_env ($auth_kind)"',
         "}",
         "",
         "publish_one() {",
@@ -480,26 +491,44 @@ def generate_publish(stat: dict, target: rl.Target, artifact_glob: str) -> str:
         '  abs_dir=$(cd "$dir" && pwd) || { log "cannot enter $dir"; return 1; }',
         "  node -e '" + MANIFEST_JS + "' \"$dir\" \"$name\" \"$version\" \"$mode\" "
         '"$req_name" "$req_version" "$main_file" "$os_name" "$cpu_name" "$registry"',
-        '  if npm view "$name@$version" version --registry "$registry" >/dev/null 2>&1; then',
-        '    log "already published: $name@$version (skipped)"',
+        "  # Publish, then read the registry answer, instead of trusting a lookup:",
+        "  # a registry that proxies or groups another one serves upstream versions of",
+        "  # the same name, so \"npm view <name>@<version>\" would report our own",
+        "  # package as already published and silently skip the whole point. Only the",
+        "  # target registry can say whether *this* version is present in it.",
+        '  local out status',
+        "  set +e",
+        '  out=$(npm publish "$abs_dir" --registry "$registry" --access public \\',
+        "    --ignore-scripts --no-audit --no-fund 2>&1)",
+        "  status=$?",
+        "  set -e",
+        "  if [ $status -eq 0 ]; then",
+        '    log "published $name@$version"',
+        "    printf '%s\\n' \"$out\" | tail -3",
         "    return 0",
         "  fi",
-        '  npm publish "$abs_dir" --registry "$registry" --access public \\',
-        "    --ignore-scripts --no-audit --no-fund",
+        '  if printf \'%s\' "$out" | grep -qE "EPUBLISHCONFLICT|409 Conflict|already exists|previously published|cannot publish over"; then',
+        '    log "already published: $name@$version (the registry refused a second publish; skipped)"',
+        "    return 0",
+        "  fi",
+        '  log "publish failed: $name@$version"',
+        '  printf \'%s\\n\' "$out" >&2',
+        "  return 1",
         "}",
         "",
-        "# Credentials first: the idempotency probe itself may need auth.",
+        "# Credentials first: publishing may need auth before it can answer.",
     ]
 
     seen_auth: set[tuple[str, str]] = set()
     for entry in entries:
         registry = str(entry.get("registry") or "https://registry.npmjs.org")
         token_env = str(entry.get("token_env") or "")
-        key = (registry, token_env)
+        auth_kind = str(entry.get("auth") or rl.PUBLISH_AUTH_TOKEN)
+        key = (registry, token_env, auth_kind)
         if key in seen_auth:
             continue
         seen_auth.add(key)
-        lines.append(f'setup_auth "{registry}" "{token_env}"')
+        lines.append(f'setup_auth "{registry}" "{token_env}" "{auth_kind}"')
 
     lines.append("")
     lines.append(
@@ -772,7 +801,8 @@ def apply_publish_scope(stat: dict, scope: str) -> None:
     """Rewrite the npm scope of every publish target, references included.
 
     GitHub Packages only accepts packages whose scope equals the repository owner,
-    so a fork cannot publish ``@ruyisdk/*``. Rewriting here keeps the recipe
+    so a fork cannot publish a package under the upstream scope. Rewriting here
+    keeps the recipe
     untouched and makes the rename explicit at render time.
     """
     clean = scope.strip().lstrip("@").strip("/")

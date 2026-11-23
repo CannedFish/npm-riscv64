@@ -10,7 +10,7 @@ pull-request and the post-merge workflow:
 
 Output (``GITHUB_OUTPUT``)::
 
-    targets=[{"pkg":"@ruyisdk/bufferutil","ver":"4.2.0","dir":"packages/...","slug":"..."}]
+    targets=[{"pkg":"bufferutil","ver":"4.2.0","dir":"packages/...","slug":"..."}]
     has_targets=true
     self_check=true|false
 

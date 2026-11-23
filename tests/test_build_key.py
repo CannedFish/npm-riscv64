@@ -273,7 +273,7 @@ class RealRepositoryKeyTests(unittest.TestCase):
     """The keys of the shipped recipes must track their build inputs."""
 
     def test_keys_are_stable_for_every_recipe(self):
-        for pkg, ver in (("@ruyisdk/bufferutil", "4.2.0"), ("@ruyisdk/utf-8-validate", "6.0.6")):
+        for pkg, ver in (("bufferutil", "4.2.0"), ("utf-8-validate", "6.0.6")):
             with self.subTest(pkg=pkg):
                 self.assertEqual(
                     build_key.build_key(REPO_ROOT, pkg, ver),
@@ -282,13 +282,13 @@ class RealRepositoryKeyTests(unittest.TestCase):
 
     def test_recipes_have_distinct_keys(self):
         self.assertNotEqual(
-            build_key.build_key(REPO_ROOT, "@ruyisdk/bufferutil", "4.2.0"),
-            build_key.build_key(REPO_ROOT, "@ruyisdk/utf-8-validate", "6.0.6"),
+            build_key.build_key(REPO_ROOT, "bufferutil", "4.2.0"),
+            build_key.build_key(REPO_ROOT, "utf-8-validate", "6.0.6"),
         )
 
     def test_recipe_build_snippet_is_part_of_the_inputs(self):
         joined = "\n".join(
-            build_key.build_inputs(REPO_ROOT, "@ruyisdk/bufferutil", "4.2.0")
+            build_key.build_inputs(REPO_ROOT, "bufferutil", "4.2.0")
         )
         self.assertIn("node-gyp rebuild", joined)
 

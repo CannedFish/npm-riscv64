@@ -8,7 +8,7 @@ and ``/w`` bind-mounted from it, mirroring the CI layout.
 
 Usage::
 
-    python3 tests/run_action_locally.py --pkg @ruyisdk/bufferutil --ver 4.2.0
+    python3 tests/run_action_locally.py --pkg bufferutil --ver 4.2.0
     python3 tests/run_action_locally.py --pkg ... --ver ... --workspace .dsh/tmp/l1
 
 The publish step is skipped unless ``--publish`` is given, mirroring the
@@ -71,6 +71,12 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("RISCV_TEST_IMAGE", ""),
         help="container image the test step runs in (defaults to the build image)",
     )
+    parser.add_argument(
+        "--auth-kind",
+        help="override npm_publish[].auth for every publish entry (token | basic); "
+        "a local registry usually wants a bearer token even when the real target "
+        "takes basic credentials",
+    )
     parser.add_argument("--clean", action="store_true", help="wipe the sandbox first")
     args = parser.parse_args(argv)
 
@@ -96,12 +102,15 @@ def main(argv: list[str] | None = None) -> int:
         "--out-dir",
         STEPS_DIR,
     ]
-    if registry:
+    if registry or args.auth_kind:
         # --override takes one field per flag, so every publish entry is patched.
         recipe_stat = (REPO_ROOT / args.root).joinpath(*args.pkg.split("/"), args.ver, ".stat")
         stat = yaml.safe_load(recipe_stat.read_text(encoding="utf-8")) or {}
         for index in range(len(stat.get("npm_publish") or [])):
-            render_cmd.append(f"--override=npm_publish.{index}.registry={registry}")
+            if registry:
+                render_cmd.append(f"--override=npm_publish.{index}.registry={registry}")
+            if args.auth_kind:
+                render_cmd.append(f"--override=npm_publish.{index}.auth={args.auth_kind}")
 
     # Render from inside the sandbox so `steps.dir` stays workspace-relative and
     # the action can resolve /w/.rendered/action inside the container.

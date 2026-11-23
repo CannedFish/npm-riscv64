@@ -1,0 +1,31 @@
+# Metadata for bufferutil 4.2.0 (see docs/recipe-spec.md).
+#
+# The path is packages/<npm name>/<version>: a recipe is identified by the package
+# it builds, not by the registry it publishes to. bufferutil is unscoped upstream
+# and stays unscoped here, so a consumer that points npm at a registry carrying
+# this recipe installs it with the very same `npm i bufferutil` it always used.
+#
+# bufferutil ships a single package that carries per-platform prebuilds
+# (prebuilds/<platform>-<arch>/bufferutil.node, loaded by node-gyp-build), so
+# there is no separate native binding package here: one publish target is
+# enough. The addon is built from source and staged as a prebuild.
+
+upstream:
+  repo: https://github.com/websockets/bufferutil
+  ref: v4.2.0
+
+artifacts:
+  path: prebuilds/linux-riscv64/*.node
+
+npm_publish:
+  - role: main
+    name: bufferutil
+    version: 4.2.0
+    dir: .
+    registry: https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local
+    token_env: NODE_AUTH_TOKEN
+    # This registry answers 401 with `WWW-Authenticate: Basic`, so the credential is
+    # the base64 of "user:password" (or "user:api-token"), not an npm bearer token.
+    auth: basic
+    # The published manifest is rewritten from here, so name and version are ours.
+    generate_manifest: true

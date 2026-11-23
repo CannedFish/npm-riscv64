@@ -633,6 +633,58 @@ class RepositoryStructureTests(unittest.TestCase):
         self.assertEqual(rl.repository_problems(self.repo.packages), [])
 
 
+class PublishAuthTests(unittest.TestCase):
+    """The generated publish step must send the credential the registry wants."""
+
+    def _publish(self, publish_entries):
+        recipe = {
+            "upstream": {"repo": "https://github.com/websockets/bufferutil", "ref": "v4.2.0"},
+            "artifacts": {"path": "prebuilds/linux-riscv64/*.node"},
+            "npm_publish": publish_entries,
+        }
+        target = rl.Target(pkg="demo", ver="1.0.0", path=Path("packages/demo/1.0.0"))
+        return render.generate_publish(recipe, target, "prebuilds/linux-riscv64/*.node")
+
+    def _entry(self, **extra):
+        entry = {
+            "role": "main",
+            "name": "demo",
+            "version": "1.0.0",
+            "dir": ".",
+            "registry": "https://registry.example.net/repository/npm-local",
+            "token_env": "NODE_AUTH_TOKEN",
+        }
+        entry.update(extra)
+        return entry
+
+    def test_basic_auth_writes_the_auth_line_keyed_by_the_full_url(self):
+        script = self._publish([self._entry(auth="basic")])
+        self.assertIn('setup_auth "https://registry.example.net/repository/npm-local" '
+                      '"NODE_AUTH_TOKEN" "basic"', script)
+        self.assertIn('_auth=${%s}', script)
+        self.assertIn('//host/repository/name/', script)  # explains the key shape
+        self.assertIn('dart="${registry#*://}"', script)
+
+    def test_token_is_the_default_and_unknown_kinds_are_refused(self):
+        script = self._publish([self._entry()])
+        self.assertIn('"NODE_AUTH_TOKEN" "token"', script)
+        target = rl.Target(pkg="demo", ver="1.0.0", path=Path("packages/demo/1.0.0"))
+        recipe = {
+            "upstream": {"repo": "https://github.com/x/y", "ref": "v1.0.0"},
+            "artifacts": {"path": "*.node"},
+            "npm_publish": [self._entry(auth="bearer")],
+        }
+        problems = rl.validate_stat(target, recipe)
+        self.assertTrue(any("auth 'bearer'" in problem for problem in problems))
+
+    def test_idempotency_trusts_the_registry_answer_not_a_lookup(self):
+        script = self._publish([self._entry()])
+        # A lookup would be fooled by a proxy/group registry serving upstream versions.
+        self.assertNotIn('npm view "$name@$version"', script)
+        self.assertIn("EPUBLISHCONFLICT", script)
+        self.assertIn("already published: $name@$version", script)
+
+
 class ManifestGenerationTests(unittest.TestCase):
     """The publish step rewrites the manifest for a re-branded package. One rule there
     is not cosmetic: npm prefers publishConfig.registry over --registry, so a manifest
@@ -720,7 +772,7 @@ class GeneratedScriptSyntaxTests(unittest.TestCase):
                     sys.executable,
                     "scripts/render.py",
                     "--pkg",
-                    "@ruyisdk/bufferutil",
+                    "bufferutil",
                     "--ver",
                     "4.2.0",
                     "--out-dir",
@@ -749,7 +801,7 @@ class GeneratedScriptSyntaxTests(unittest.TestCase):
                     sys.executable,
                     "scripts/render.py",
                     "--pkg",
-                    "@ruyisdk/bufferutil",
+                    "bufferutil",
                     "--ver",
                     "4.2.0",
                     "--out-dir",
@@ -783,7 +835,7 @@ class GoldenTests(unittest.TestCase):
                 sys.executable,
                 "scripts/render.py",
                 "--pkg",
-                "@ruyisdk/bufferutil",
+                "bufferutil",
                 "--ver",
                 "4.2.0",
                 "--out-dir",

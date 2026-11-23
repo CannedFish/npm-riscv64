@@ -1,5 +1,5 @@
-name: "build @ruyisdk/bufferutil@4.2.0 (riscv64)"
-description: "Generated from packages/@ruyisdk/bufferutil/4.2.0 by scripts/render.py - do not edit by hand."
+name: "build bufferutil@4.2.0 (riscv64)"
+description: "Generated from packages/bufferutil/4.2.0 by scripts/render.py - do not edit by hand."
 # The name uses the publish target, so a fork that rewrites the scope (PUBLISH_SCOPE)
 # shows the package it actually publishes.
 

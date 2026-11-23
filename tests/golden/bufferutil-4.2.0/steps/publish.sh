@@ -11,15 +11,26 @@ export NPM_CONFIG_USERCONFIG="$REPO_ROOT/.npmrc.publish"
 log() { echo "[publish] $*"; }
 
 setup_auth() {
-  local registry="$1" token_env="$2"
+  local registry="$1" token_env="$2" auth_kind="$3"
   [ -n "$token_env" ] || return 0
   if [ -z "${!token_env:-}" ]; then
-    log "no token in $token_env; talking to $registry unauthenticated"
+    log "no credential in $token_env; talking to $registry unauthenticated"
     return 0
   fi
-  local host="${registry#*://}"; host="${host%%/*}"
-  printf '//%s/:_authToken=${%s}\n' "$host" "$token_env" >> "$NPM_CONFIG_USERCONFIG"
-  log "auth configured for $host via $token_env"
+  # npm looks credentials up by the registry URL it talks to, path included:
+  # "//host/repository/name/" is the key for a registry at .../repository/name/.
+  local dart="${registry#*://}"
+  dart="${dart%%\?*}"
+  dart="//$dart"
+  [ "${dart: -1}" = "/" ] || dart="$dart/"
+  if [ "$auth_kind" = "basic" ]; then
+    # Basic credentials: base64 of user:password, as the registry asks for it
+    # (WWW-Authenticate: Basic).
+    printf '%s:_auth=${%s}\n' "$dart" "$token_env" >> "$NPM_CONFIG_USERCONFIG"
+  else
+    printf '%s:_authToken=${%s}\n' "$dart" "$token_env" >> "$NPM_CONFIG_USERCONFIG"
+  fi
+  log "auth configured for $dart via $token_env ($auth_kind)"
 }
 
 publish_one() {
@@ -107,19 +118,36 @@ if (registryUrl && pkg.publishConfig && pkg.publishConfig.registry
 fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");
 console.log("[publish] wrote " + file + " (" + mode + ")");
 ' "$dir" "$name" "$version" "$mode" "$req_name" "$req_version" "$main_file" "$os_name" "$cpu_name" "$registry"
-  if npm view "$name@$version" version --registry "$registry" >/dev/null 2>&1; then
-    log "already published: $name@$version (skipped)"
+  # Publish, then read the registry answer, instead of trusting a lookup:
+  # a registry that proxies or groups another one serves upstream versions of
+  # the same name, so "npm view <name>@<version>" would report our own
+  # package as already published and silently skip the whole point. Only the
+  # target registry can say whether *this* version is present in it.
+  local out status
+  set +e
+  out=$(npm publish "$abs_dir" --registry "$registry" --access public \
+    --ignore-scripts --no-audit --no-fund 2>&1)
+  status=$?
+  set -e
+  if [ $status -eq 0 ]; then
+    log "published $name@$version"
+    printf '%s\n' "$out" | tail -3
     return 0
   fi
-  npm publish "$abs_dir" --registry "$registry" --access public \
-    --ignore-scripts --no-audit --no-fund
+  if printf '%s' "$out" | grep -qE "EPUBLISHCONFLICT|409 Conflict|already exists|previously published|cannot publish over"; then
+    log "already published: $name@$version (the registry refused a second publish; skipped)"
+    return 0
+  fi
+  log "publish failed: $name@$version"
+  printf '%s\n' "$out" >&2
+  return 1
 }
 
-# Credentials first: the idempotency probe itself may need auth.
-setup_auth "https://npm.pkg.github.com" "NODE_AUTH_TOKEN"
+# Credentials first: publishing may need auth before it can answer.
+setup_auth "https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local" "NODE_AUTH_TOKEN" "basic"
 
 # Publish order: native/binary packages first, then the JS package that
 # references them through optionalDependencies.
-publish_one "." "@ruyisdk/bufferutil" "4.2.0" "https://npm.pkg.github.com" "generate" "" "" "" ""
+publish_one "." "bufferutil" "4.2.0" "https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local" "generate" "" "" "" ""
 
-log "publish finished for @ruyisdk/bufferutil@4.2.0"
+log "publish finished for bufferutil@4.2.0"
