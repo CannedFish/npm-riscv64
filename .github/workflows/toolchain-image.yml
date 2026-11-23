@@ -51,12 +51,30 @@ jobs:
       - name: Set up buildx
         uses: docker/setup-buildx-action@v3
 
+      # Pushing to GHCR needs write access to the *package*, not just
+      # `packages: write` in the workflow: GitHub grants the repository token write
+      # access only when the package is linked to this repository. A package created
+      # by a manual push from a laptop (with a personal token) is not linked, and
+      # the push then fails with "denied: permission_denied: read_package".
+      #
+      # Two ways out: link the package (Package settings -> Manage Actions access ->
+      # add this repository with the Write role), or - what this step prefers - give
+      # the workflow a classic PAT with `write:packages` as the GHCR_TOKEN secret. A
+      # PAT does not depend on the link, so it also survives the package being
+      # deleted and recreated.
       - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${GHCR_TOKEN:-}" ]; then
+            echo "logging in with the GHCR_TOKEN secret (PAT with write:packages)"
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          else
+            echo "no GHCR_TOKEN secret set: using the workflow token, which needs the"
+            echo "package to be linked to this repository (see the comment above)"
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          fi
 
       - name: Build and push
         env:
@@ -82,8 +100,15 @@ jobs:
           # --push is what makes the result leave the build cache. Without it the
           # step can succeed while publishing nothing, and the next `docker run`
           # fails with "Unable to find image locally".
+          # The source label is what makes GHCR link the package to this
+          # repository. Without the link the repository token keeps read-only access,
+          # which is the "permission_denied: read_package" push failure. It is spelled
+          # out here instead of in the Dockerfile because every fork pushes into its
+          # own namespace.
           docker buildx build \
             --platform "$PLATFORM" \
             --file "$DOCKERFILE" \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
             "${tags[@]}" \
             --push .

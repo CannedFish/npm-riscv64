@@ -135,6 +135,18 @@ For a private package, either connect the package to the repository or add a tok
 with `read:packages` as `GHCR_TOKEN`. Locally, L1 works the same way: it uses the
 local tag if present and pulls `RISCV_IMAGE` when it is missing.
 
+Pushing the images is a permission question about the **package**, not about the
+workflow: `packages: write` is not enough when the package is not linked to the
+repository. A package that was first pushed by hand with a personal token stays
+unlinked, and the workflow token then keeps read-only access - the push fails with
+`denied: permission_denied: read_package`. Fix it either way:
+
+* link the package: `Package settings -> Manage Actions access -> add <owner>/<repo>`
+  with the Write role (the image workflow also labels images with
+  `org.opencontainers.image.source`, so a later push links them automatically), or
+* set a `GHCR_TOKEN` secret holding a classic PAT with `write:packages`; the image
+  workflow prefers that secret when it is present.
+
 ## Running it in a fork
 
 Publishing to GitHub Packages requires the npm scope to equal the repository owner,
