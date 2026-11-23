@@ -91,35 +91,67 @@ template or renderer edit that adds an input, an `if:` guard or a comment change
 command, so no recipe is rebuilt, while recipe changes always rebuild. See
 `docs/recipe-spec.md` for the exact rules.
 
-## Container image
+## Container images
 
-Build and test run inside a riscv64 image. It is **not** built on every run: build it
-once, publish it, and let CI pull it.
+There are two, matching the `toolchain:` value of a recipe:
+
+| image | used by | contents |
+| --- | --- | --- |
+| `npm-riscv64-toolchain:riscv64` | `native` recipes (default) | riscv64 base, node, node-gyp, native build tools |
+| `npm-riscv64-toolchain:cross` | `cross` recipes | amd64 base, pinned rust toolchain + `riscv64-linux-gnu` gcc, cross linker env |
+
+A cross recipe builds in the first image's amd64 counterpart and *tests* in the
+riscv64 one, so the artifact is still executed on the target CPU. Neither image is
+built on every run: build them once, publish them, and let CI pull them.
 
 ```bash
-# local build (needs qemu binfmt, or docker buildx with --platform)
+# local builds (the riscv64 one needs qemu binfmt, or docker buildx --platform)
 docker build --platform linux/riscv64 \
   -f docker/riscv64-toolchain.Dockerfile \
   -t ghcr.io/<owner>/npm-riscv64-toolchain:riscv64 .
+docker build --platform linux/amd64 \
+  -f docker/riscv64-cross.Dockerfile \
+  -t ghcr.io/<owner>/npm-riscv64-toolchain:cross .
 
-# publish it (needs a token with write:packages)
+# publish them (needs a token with write:packages)
 echo "$GH_TOKEN" | docker login ghcr.io -u <owner> --password-stdin
 docker push ghcr.io/<owner>/npm-riscv64-toolchain:riscv64
+docker push ghcr.io/<owner>/npm-riscv64-toolchain:cross
 ```
 
 `ghcr.io/<owner>/...` must be lowercase, so `CannedFish` becomes `cannedfish`. The
-`build riscv64 toolchain image` workflow does the same on a runner
-(`Actions -> build riscv64 toolchain image -> Run workflow`); run it again whenever
-`docker/riscv64-toolchain.Dockerfile` changes.
+`build toolchain images` workflow does the same on a runner
+(`Actions -> build toolchain images -> Run workflow`); run it again whenever a
+`docker/*.Dockerfile` changes.
 
-CI resolves the image as `vars.RISCV_IMAGE` when set, otherwise
-`ghcr.io/${{ github.repository_owner }}/npm-riscv64-toolchain:riscv64`, and pulls it
-before the build. It only authenticates when a `GHCR_TOKEN` secret is set: a public
+CI resolves the build image as `vars.RISCV_IMAGE` when set, otherwise
+`ghcr.io/${{ github.repository_owner }}/npm-riscv64-toolchain:riscv64`, and the
+cross image as `vars.RISCV_CROSS_IMAGE` or (from a custom `RISCV_IMAGE`) the same
+repository with the `:cross` tag. Both are pulled before the build; the cross image
+only by the jobs that use it. It only authenticates when a `GHCR_TOKEN` secret is set: a public
 package pulls anonymously, and logging in with the wrong token turns a public image
 into `403 Forbidden` (docker never falls back to anonymous once credentials exist).
 For a private package, either connect the package to the repository or add a token
 with `read:packages` as `GHCR_TOKEN`. Locally, L1 works the same way: it uses the
 local tag if present and pulls `RISCV_IMAGE` when it is missing.
+
+Each tag holds one platform only, so a pull has to name it:
+`docker pull --platform linux/riscv64 <image>:riscv64`. Without `--platform` the
+daemon asks for the platform of the host and the registry answers
+`no matching manifest for linux/amd64 in the manifest list entries`. The action and
+`build.yml` do this for you; it only matters when you pull by hand.
+
+Pushing the images is a permission question about the **package**, not about the
+workflow: `packages: write` is not enough when the package is not linked to the
+repository. A package that was first pushed by hand with a personal token stays
+unlinked, and the workflow token then keeps read-only access - the push fails with
+`denied: permission_denied: read_package`. Fix it either way:
+
+* link the package: `Package settings -> Manage Actions access -> add <owner>/<repo>`
+  with the Write role (the image workflow also labels images with
+  `org.opencontainers.image.source`, so a later push links them automatically), or
+* set a `GHCR_TOKEN` secret holding a classic PAT with `write:packages`; the image
+  workflow prefers that secret when it is present.
 
 ## Running it in a fork
 

@@ -64,7 +64,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--image",
         default=os.environ.get("RISCV_IMAGE", "npm-riscv64/toolchain:riscv64"),
-        help="riscv64 container image",
+        help="container image the build steps run in (the cross image for a cross recipe)",
+    )
+    parser.add_argument(
+        "--test-image",
+        default=os.environ.get("RISCV_TEST_IMAGE", ""),
+        help="container image the test step runs in (defaults to the build image)",
     )
     parser.add_argument("--clean", action="store_true", help="wipe the sandbox first")
     args = parser.parse_args(argv)
@@ -117,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     env.update(
         GITHUB_WORKSPACE=str(workspace),
         RISCV_IMAGE=args.image,
+        RISCV_TEST_IMAGE=args.test_image or args.image,
         PYTHONUNBUFFERED="1",
         # Keep npm caches inside the sandbox: the host home may be read-only.
         npm_config_cache=str(workspace / ".npm-cache"),
@@ -124,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"workspace: {workspace}")
     print(f"image    : {args.image}")
+    print(f"test img : {env['RISCV_TEST_IMAGE']}")
     failures = 0
     for step in steps:
         name = str(step.get("name", "?"))

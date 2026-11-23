@@ -18,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import detect_targets as dt  # noqa: E402
+import recipe_lib as rl  # noqa: E402
 
 TEMPLATE = ".github/templates/action.template.yml"
 
@@ -407,6 +408,53 @@ class BuildInputNarrowingTests(unittest.TestCase):
 
     def repo_previous_commit(self) -> str:
         return git(self.root, "rev-parse", "HEAD").strip()
+
+
+class PayloadTests(unittest.TestCase):
+    """The matrix payload is the contract with build.yml: a field going missing here
+    breaks the workflow, not the renderer."""
+
+    def test_payload_carries_the_toolchain(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        stat = (
+            "upstream:\n  repo: https://github.com/example/demo\n  ref: v1.0.0\n"
+            "toolchain: cross\n"
+            "artifacts:\n  path: out/pkg/dist/shared/*.node\n"
+            'npm_publish:\n  - role: main\n    name: "@demo/widget"\n    version: 1.0.0\n'
+            "    dir: out/pkg\n    generate_manifest: true\n"
+        )
+        (root / "packages/demo/1.0.0").mkdir(parents=True)
+        (root / "packages/demo/1.0.0/.stat").write_text(stat, encoding="utf-8")
+        (root / "packages/demo/1.0.0/commands").mkdir()
+        (root / "packages/demo/1.0.0/commands/build").write_text("echo build\n", encoding="utf-8")
+        (root / "packages/demo/1.0.0/commands/test").write_text("echo test\n", encoding="utf-8")
+
+        target = rl.find_target(root / "packages", "demo", "1.0.0")
+        payload = dt.target_payload(target, rl.load_stat(target))
+        self.assertEqual(payload["toolchain"], "cross")
+        self.assertEqual(payload["artifact_glob"], "out/pkg/dist/shared/*.node")
+        self.assertEqual(payload["artifact_dir"], "out/pkg/dist/shared")
+
+    def test_payload_defaults_to_native(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "packages/demo/1.0.0").mkdir(parents=True)
+        (root / "packages/demo/1.0.0/.stat").write_text(
+            "upstream:\n  repo: https://github.com/example/demo\n  ref: v1.0.0\n"
+            "artifacts:\n  path: build/Release/*.node\n"
+            'npm_publish:\n  - role: main\n    name: "@demo/widget"\n    version: 1.0.0\n'
+            "    dir: .\n    generate_manifest: true\n",
+            encoding="utf-8",
+        )
+        (root / "packages/demo/1.0.0/commands").mkdir()
+        (root / "packages/demo/1.0.0/commands/build").write_text("echo build\n", encoding="utf-8")
+        (root / "packages/demo/1.0.0/commands/test").write_text("echo test\n", encoding="utf-8")
+        target = rl.find_target(root / "packages", "demo", "1.0.0")
+        self.assertEqual(dt.target_payload(target, rl.load_stat(target))["toolchain"], "native")
+
 
 
 if __name__ == "__main__":

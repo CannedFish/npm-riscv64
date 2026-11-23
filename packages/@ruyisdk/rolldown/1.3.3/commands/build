@@ -1,0 +1,31 @@
+#!/bin/bash
+# Builds the native binding for riscv64 and drops it into the wrapper's dist
+# directory. Runs in the cross image (amd64 + riscv64 cross toolchain): the
+# workspace is large, and qemu turns a three minute build into hours.
+set -euo pipefail
+
+TARGET="${RISCV_TARGET:-riscv64gc-unknown-linux-gnu}"
+# The name the wrapper's loader probes for inside dist/shared/.
+BINDING_NAME="rolldown-binding.linux-riscv64-gnu.node"
+WRAPPER="out/rolldown"
+
+test -d "$WRAPPER/dist" || {
+  echo "ERROR: the wrapper is missing ($WRAPPER/dist); the fetch step places it there" >&2
+  exit 1
+}
+
+echo "[build] cargo build --release -p rolldown_binding --target $TARGET"
+# Only the binding crate is built. The workspace's own JS tooling (@oxc-node/core,
+# rolldown's bundler) is not needed and could not run here anyway.
+cargo build --release -p rolldown_binding --target "$TARGET"
+
+# napi-rs names the cdylib after the crate; the loader wants the platform name.
+install -m 0644 "target/$TARGET/release/librolldown_binding.so" "$WRAPPER/dist/shared/$BINDING_NAME"
+
+if ! file -b "$WRAPPER/dist/shared/$BINDING_NAME" | grep -q "RISC-V"; then
+  echo "ERROR: $WRAPPER/dist/shared/$BINDING_NAME is not a RISC-V object:" >&2
+  file "$WRAPPER/dist/shared/$BINDING_NAME" >&2
+  exit 1
+fi
+
+echo "[build] binding: $WRAPPER/dist/shared/$BINDING_NAME ($(du -h "$WRAPPER/dist/shared/$BINDING_NAME" | cut -f1))"

@@ -10,6 +10,11 @@
 # The base image is the official Debian port for riscv64; everything else is
 # installed through the Debian archive so the toolchain matches what a
 # riscv64 distribution would ship.
+# The platform is spelled out on purpose: this image is riscv64-only, and a plain
+# `docker build` on an amd64 host would otherwise produce an amd64 image under a
+# riscv64 name. BuildKit warns about a constant FROM --platform (it is an
+# anti-pattern for multi-arch images); that warning is expected here, the inability
+# to build the wrong platform silently is the point.
 FROM --platform=linux/riscv64 debian:trixie-slim
 
 ENV DEBIAN_FRONTEND=noninteractive

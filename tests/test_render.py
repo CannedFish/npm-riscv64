@@ -7,7 +7,9 @@ second copy of the recipe format drifting away from docs/recipe-spec.md.
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -252,6 +254,72 @@ class RecipeTests(unittest.TestCase):
         with self.assertRaises(render.RenderError) as ctx:
             self.render("@demo/pkg", "1.0.0")
         self.assertIn("unknown command snippet 'biuld'", str(ctx.exception))
+
+    # ---------------------------------------------------------- toolchain kind
+    def _cross_stat(self, ver="1.0.0"):
+        return STAT_TEMPLATE.format(ver=ver, name="@demo/pkg") + "toolchain: cross\n"
+
+    def test_native_is_the_default_toolchain(self):
+        self.repo.add_recipe("@demo/pkg", "1.0.0")
+        rendered, _ = self.render("@demo/pkg", "1.0.0")
+        action = yaml.safe_load(rendered)
+        steps = {step.get("name"): step["run"] for step in action["runs"]["steps"]}
+        # Everything runs on riscv64, and nothing mentions the cross toolchain.
+        for name in ("fetch upstream source", "build", "test"):
+            self.assertIn("--platform linux/riscv64", steps[name], name)
+            self.assertIn("npm-riscv64/toolchain:riscv64", steps[name], name)
+        # No *executed* amd64 platform anywhere (a comment may name it).
+        self.assertNotIn("--platform linux/amd64", rendered)
+        self.assertNotIn('pull_image "linux/amd64"', rendered)
+        self.assertNotIn("riscv64-linux-gnu-gcc", rendered)
+        # Both images of a native recipe are the riscv64 one, pulled by platform.
+        self.assertIn('pull_image "linux/riscv64" "$image"', steps["prepare toolchain"])
+        self.assertIn('pull_image "linux/riscv64" "$test_image"', steps["prepare toolchain"])
+        self.assertNotIn("RISCV_TARGET", rendered)
+
+    def test_cross_recipe_builds_on_amd64_and_tests_on_riscv64(self):
+        self.repo.add_recipe("@demo/pkg", "1.0.0", stat=self._cross_stat())
+        rendered, _ = self.render("@demo/pkg", "1.0.0")
+        action = yaml.safe_load(rendered)
+        steps = {step.get("name"): step["run"] for step in action["runs"]["steps"]}
+        # The producing steps run on the host architecture with the cross toolchain,
+        # and the target triple is handed to the recipe.
+        for name in ("fetch upstream source", "build"):
+            self.assertIn("--platform linux/amd64", steps[name], name)
+            self.assertIn("npm-riscv64/toolchain:cross", steps[name], name)
+        self.assertIn("-e RISCV_TARGET=riscv64gc-unknown-linux-gnu", steps["build"])
+        # The test step still runs on riscv64, on the native image.
+        self.assertIn("--platform linux/riscv64", steps["test"])
+        self.assertIn(
+            'image="${RISCV_TEST_IMAGE:-${RISCV_IMAGE:-npm-riscv64/toolchain:riscv64}}"',
+            steps["test"],
+        )
+        # The prepare step proves the cross toolchain works before anything else runs.
+        self.assertIn("riscv64-linux-gnu-gcc --version", steps["prepare toolchain"])
+        self.assertIn("docker/riscv64-cross.Dockerfile", steps["prepare toolchain"])
+        # Each published image is single-platform, so a pull that does not name the
+        # platform fails on the runner with "no matching manifest for linux/amd64".
+        self.assertIn('pull_image "linux/amd64" "$image"', steps["prepare toolchain"])
+        self.assertIn('pull_image "linux/riscv64" "$test_image"', steps["prepare toolchain"])
+
+    def test_cross_patch_step_runs_on_the_build_platform(self):
+        # Patches are applied with git inside the build container; they are not
+        # riscv64-specific, so they belong to the build side of the cross split.
+        self.repo.add_recipe("@demo/pkg", "1.0.0", stat=self._cross_stat(), patches={"fix.patch": "diff\n"})
+        rendered, _ = self.render("@demo/pkg", "1.0.0")
+        action = yaml.safe_load(rendered)
+        steps = {step.get("name"): step["run"] for step in action["runs"]["steps"]}
+        self.assertIn("--platform linux/amd64", steps["apply patches"])
+
+    def test_unknown_toolchain_is_rejected(self):
+        self.repo.add_recipe(
+            "@demo/pkg",
+            "1.0.0",
+            stat=STAT_TEMPLATE.format(ver="1.0.0", name="@demo/pkg") + "toolchain: zig\n",
+        )
+        with self.assertRaises(render.RenderError) as ctx:
+            self.render("@demo/pkg", "1.0.0")
+        self.assertIn("toolchain 'zig' is not supported", str(ctx.exception))
 
     def test_version_snippet_overrides_common(self):
         self.repo.add_recipe(
@@ -563,6 +631,82 @@ class RepositoryStructureTests(unittest.TestCase):
         self.repo.add_recipe("@demo/pkg", "1.0.0")
         self.repo.add_recipe("@demo/pkg", "2.0.0")
         self.assertEqual(rl.repository_problems(self.repo.packages), [])
+
+
+class ManifestGenerationTests(unittest.TestCase):
+    """The publish step rewrites the manifest for a re-branded package. One rule there
+    is not cosmetic: npm prefers publishConfig.registry over --registry, so a manifest
+    that pins its own registry would publish somewhere the recipe did not ask for."""
+
+    NODE = shutil.which("node")
+
+    def run_manifest(self, directory: Path, mode: str, registry: str = "https://example.invalid") -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [
+                self.NODE,
+                "-e",
+                render.MANIFEST_JS,
+                str(directory),
+                "@demo/widget",
+                "1.0.0",
+                mode,
+                "",
+                "",
+                "",
+                "",
+                "",
+                registry,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+    def setUp(self):
+        if not self.NODE:
+            self.skipTest("node is required to exercise the manifest snippet")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def write_manifest(self, publish_config: dict | None = None, name: str = "@demo/widget") -> None:
+        manifest = {"name": name, "version": "1.0.0", "files": ["dist"]}
+        if publish_config is not None:
+            manifest["publishConfig"] = publish_config
+        (self.dir / "package.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    def manifest(self) -> dict:
+        return json.loads((self.dir / "package.json").read_text(encoding="utf-8"))
+
+    def test_generate_realigns_a_pinned_registry(self):
+        # An upstream manifest that pins npmjs.org must not win over the recipe.
+        # The upstream name is what generate mode is allowed to rewrite; the registry
+        # is pinned upstream and must be realigned too.
+        self.write_manifest({"access": "public", "registry": "https://registry.npmjs.org/"}, name="widget")
+        result = self.run_manifest(self.dir, "generate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.manifest()["name"], "@demo/widget")
+        self.assertEqual(self.manifest()["publishConfig"]["registry"], "https://example.invalid")
+        self.assertEqual(self.manifest()["publishConfig"]["access"], "public")
+        self.assertIn("publishConfig.registry", result.stdout)
+
+    def test_generate_keeps_an_equal_registry_untouched(self):
+        self.write_manifest({"registry": "https://example.invalid"})
+        result = self.run_manifest(self.dir, "generate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("publishConfig.registry", result.stdout)
+
+    def test_verify_rejects_a_pinned_registry(self):
+        # Without generate mode the renderer must not rewrite the manifest, so the
+        # only safe reaction is to stop.
+        self.write_manifest({"registry": "https://registry.npmjs.org/"})
+        result = self.run_manifest(self.dir, "verify")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("publishConfig.registry", result.stderr)
+
+    def test_verify_accepts_a_matching_registry(self):
+        self.write_manifest({"registry": "https://example.invalid/"})
+        result = self.run_manifest(self.dir, "verify")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class GeneratedScriptSyntaxTests(unittest.TestCase):
