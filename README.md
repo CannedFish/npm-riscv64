@@ -225,6 +225,27 @@ consumer tries it:
   @oxc-project:registry=https://registry.npmjs.org/
   replace-registry-host=never
   ```
+
+  Pointing the group repository at npm instead of mapping scopes is the simpler
+  arrangement: `npm i rolldown --registry=https://…/repository/npm-rv-test-group`
+  resolves our build first and every other package from its npmjs proxy, with no
+  `.npmrc` changes and no `replace-registry-host` trap.
+* a **globally** installed CLI is a separate copy. `npm i -g rolldown` fetches upstream
+  unless it is pointed at this registry, and upstream carries none of the riscv64
+  bindings, so the CLI on `PATH` keeps failing with "Cannot find native binding" even
+  while the project install is correct. Reinstall it from the registry - or run the
+  project copy with `npx rolldown` - and check what actually landed:
+
+  ```
+  npm i -g rolldown@1.3.3 --registry=https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-group
+  ls -l /usr/local/lib/node_modules/rolldown/dist/shared/*.node   # the riscv64 binding must be there
+  rolldown src/main.js --file bundle.js
+  ```
+
+  (A group repository with an npmjs proxy also makes `npm i -g` behave: the
+  alternative is mapping `@rolldown` and `@oxc-project` to npmjs and setting
+  `replace-registry-host=never`, as above.)
+
 * a version that also exists upstream looks identical to a proxying registry. Hosted
   members win in a group repository, so consumers get the riscv64 build - but a
   `latest` that upstream has already moved past resolves to the binding-less upstream
