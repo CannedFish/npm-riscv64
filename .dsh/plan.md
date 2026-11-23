@@ -899,3 +899,19 @@ rolldown 只需要交叉 gcc 做链接，不涉及该限制。
 | 消费者（riscv64，上游 npmjs 对照） | `npm i rolldown` → `added 3 packages`（16 个 optionalDependencies 全被 os/cpu 跳过），运行 → `Cannot find native binding`（退化到 wasm32-wasi 分支） |
 | 消费者（bufferutil） | `npm i bufferutil` → 解析到 `prebuilds/linux-riscv64/bufferutil.node`，`unmask` 往返一致（23 字节） |
 | 已知坑 | 原生 `mask` 是 5 参数（`source, mask, dest, offset, length`）、`unmask` 是 2 参数（就地还原）；用 2 参数调 `mask` 会触发上游 `assert` 崩溃——**是调用者的错，不是产物的错**（第一版自测就踩了） |
+
+### D30 「publish 卡住」的排查结论与可见性修复
+
+* 目标仓库侧没有问题：本地实测 10 MB 裸上传 `http=200 / 85ms`；真实小包发布 `PUT 201 / 199ms`；
+  9.4 MB 的 `rolldown@1.3.3` 发布 `PUT 201 / 865ms`（整条命令 4.2s）。
+* CI 里"卡在 publish 不动"的直接原因是**我们自己的脚本把 npm 的输出吞了**：`out=$(npm publish ...)`
+  在命令结束前不产生任何日志，慢上传因此表现为完全静止。已改成 `| tee` 流式输出 + `--loglevel http`，
+  CI 日志会直接出现 `npm http fetch PUT ... <耗时>`，慢路线一眼可见。
+* 另一个先决条件：`.stat` 的 registry **必须以 `/` 结尾**（D28 的 `normalize_registry`）。否则 npm 用
+  `new URL(".", url)` 推凭据 key 时会砍掉最后一段，`npm publish` 预检拿不到凭据 → `ENEEDAUTH`
+  且**一个请求都不发**（本地 mini registry 复现，见 change log §8）。
+* 消费者侧实测（真仓库 + scope 分流）：`.npmrc` 用 `registry=<hosted>`、`@rolldown:registry` /
+  `@oxc-project:registry` 指向 npmjs，并加 **`replace-registry-host=never`**（否则 npm 会把 npmjs 的
+  tarball URL 改写回默认仓库 → tarball 404）。riscv64 容器内 `npm i rolldown` → `added 3 packages` →
+  `bundle ok, arch=riscv64`。
+

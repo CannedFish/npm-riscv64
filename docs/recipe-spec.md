@@ -160,14 +160,18 @@ For every entry:
    | generate | `generate_manifest: true` | create the manifest when it is missing, update it when it exists: `name` and `version` come from `.stat`, every other field is preserved |
    | verify | `generate_manifest` absent/false | the manifest must exist and its `name`/`version` must match `.stat`; a mismatch is a hard failure |
 
-3. idempotency: `npm publish` runs, and the registry answer decides. A "this
+3. visibility: the publish runs with `--loglevel http` and its output is streamed
+   (`| tee`) instead of captured, because a captured npm looks frozen in CI logs
+   until it exits - a slow upload then reads as "publish hangs" with no evidence.
+   The streamed text is still classified in (4).
+4. idempotency: `npm publish` runs, and the registry answer decides. A "this
    version already exists" refusal (409 / `EPUBLISHCONFLICT` / "cannot publish
    over") is logged as a skip so a rerun stays green; anything else fails. A plain
    `npm view <name>@<version>` lookup is deliberately not used: a registry that
    proxies or groups another one serves upstream versions of the same name, so the
    lookup reports our own package as published and the publish silently never
    happens (witnessed with verdaccio and `bufferutil@4.2.0`);
-4. credentials: `token_env` names an environment variable; when it is set, a line
+5. credentials: `token_env` names an environment variable; when it is set, a line
    keyed by the **full registry URL** (path included, npm looks credentials up by the
    URL it talks to) is written to a throwaway `.npmrc`. The registry URL is normalized
    to end with `/` first: npm computes the credential key with
@@ -178,7 +182,7 @@ For every entry:
    `//<host>/<path>/:_auth=${TOKEN_ENV}` for `auth: basic`, which is what a registry
    answering `WWW-Authenticate: Basic` expects (the value is base64 `user:password`).
    before the idempotency probe (a private registry needs auth even to answer it);
-5. `npm publish <dir> --registry <registry> --access public --ignore-scripts`.
+6. `npm publish <dir> --registry <registry> --access public --ignore-scripts`.
 
 `name` is identity: with `verify`, renaming a package is refused rather than
 published under a second name. With `generate_manifest: true`, a rename is a

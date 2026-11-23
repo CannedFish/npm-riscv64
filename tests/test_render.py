@@ -694,6 +694,14 @@ class PublishAuthTests(unittest.TestCase):
         self.assertEqual(render.normalize_registry("https://registry.npmjs.org"),
                          "https://registry.npmjs.org/")
 
+    def test_publish_output_is_streamed_with_request_timing(self):
+        script = self._publish([self._entry()])
+        # A captured npm prints nothing until it exits, which reads as "publish hangs"
+        # when the upload is slow; tee keeps the log moving.
+        self.assertIn("| tee", script)
+        self.assertIn("--loglevel http", script)
+        self.assertIn("status=${PIPESTATUS[0]}", script)
+
     def test_idempotency_trusts_the_registry_answer_not_a_lookup(self):
         script = self._publish([self._entry()])
         # A lookup would be fooled by a proxy/group registry serving upstream versions.

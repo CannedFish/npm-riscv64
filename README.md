@@ -186,7 +186,11 @@ gh secret set NPM_PUBLISH_TOKEN --repo <owner>/npm-riscv64   # paste the base64 
 ```
 
 The workflow maps `secrets.NPM_PUBLISH_TOKEN` to `NODE_AUTH_TOKEN` for the action, so
-adding that secret is the only setup a fork needs. A recipe pointed at a bearer-token
+adding that secret is the only setup a fork needs. The publish step streams npm's
+output with `--loglevel http`: a 9 MB upload takes a second from a machine next to the
+registry but minutes over a slow route, and a captured npm would show nothing until it
+finished. If the route really is slow, raise npm's `fetch-timeout` (`npm config set
+fetch-timeout 900000`) rather than wondering why the step sits there. A recipe pointed at a bearer-token
 registry (GitHub Packages, Nexus npm tokens) uses `auth: token` instead and the secret
 holds the token verbatim.
 
@@ -208,9 +212,19 @@ consumer tries it:
 
 * the registry must be the one the consumer resolves that name from. `npm-rv-test-local`
   is a hosted repository, so it carries only the packages published into it; a consumer
-  pointing npm straight at it gets `404` for every ordinary dependency. Put it in a
-  group/virtual repository together with a proxy to npmjs, or map the scope of each
-  dependency to npmjs in the consumer's `.npmrc`.
+  pointing npm straight at it gets `404` for every ordinary dependency. Either put it in
+  a group/virtual repository together with a proxy to npmjs, or map the scopes of the
+  dependencies in the consumer's `.npmrc` - and set `replace-registry-host=never`, or
+  npm rewrites the npmjs tarball URL to the default registry and the install 404s on
+  the tarball instead of the metadata:
+
+  ```ini
+  registry=https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/
+  //forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/:_auth=<base64>
+  @rolldown:registry=https://registry.npmjs.org/
+  @oxc-project:registry=https://registry.npmjs.org/
+  replace-registry-host=never
+  ```
 * a version that also exists upstream looks identical to a proxying registry. Hosted
   members win in a group repository, so consumers get the riscv64 build - but a
   `latest` that upstream has already moved past resolves to the binding-less upstream
