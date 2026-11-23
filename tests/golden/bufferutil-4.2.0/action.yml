@@ -3,9 +3,19 @@ description: "Generated from packages/@ruyisdk/bufferutil/4.2.0 by scripts/rende
 # The name uses the publish target, so a fork that rewrites the scope (PUBLISH_SCOPE)
 # shows the package it actually publishes.
 
-# The riscv64 container is pinned here on purpose: changing this template changes
-# every recipe, and a template change forces a full rebuild (see .dsh/plan.md D7).
-# Override the image at run time with the RISCV_IMAGE environment variable.
+# Two toolchains are supported, chosen per recipe by `toolchain:` in .stat:
+#
+#   native (default) - fetch/patch/build/test all run inside a riscv64 container
+#     under qemu. Slower, but nothing is cross-compiled: the compiler itself runs
+#     on the target CPU.
+#   cross - fetch/patch/build run in an amd64 container carrying the riscv64 cross
+#     toolchain (rustc + riscv64-linux-gnu gcc), and only the test step runs in the
+#     riscv64 container, so the produced artifact is still exercised on its own CPU.
+#     For a large Rust workspace this is minutes instead of hours.
+#
+# Override the images at run time with RISCV_IMAGE (build) and RISCV_TEST_IMAGE
+# (test, defaults to RISCV_IMAGE). The images are pinned here on purpose: changing
+# this template changes every recipe (see .dsh/plan.md D7).
 #
 # Containers run as the calling user (RISCV_DOCKER_USER overrides it) and get a
 # workspace HOME. Running as root would leave root-owned files in the workspace,
@@ -25,22 +35,27 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: prepare riscv64 emulation
+    - name: prepare toolchain
       shell: bash
       run: |
         set -euo pipefail
         image="${RISCV_IMAGE:-npm-riscv64/toolchain:riscv64}"
-        echo "riscv image: $image"
-        if ! docker image inspect "$image" >/dev/null 2>&1; then
-          echo "image not present locally, pulling $image"
-          if ! docker pull "$image"; then
-            echo "ERROR: cannot pull $image" >&2
-            echo "Set RISCV_IMAGE to a reachable image (see the toolchain-image workflow)," >&2
-            echo "or build it locally:" >&2
+        test_image="${RISCV_TEST_IMAGE:-${RISCV_IMAGE:-npm-riscv64/toolchain:riscv64}}"
+        echo "build image: $image (linux/riscv64) via native toolchain"
+        echo "test image: $test_image (linux/riscv64)"
+        for one in "$image" "$test_image"; do
+          if docker image inspect "$one" >/dev/null 2>&1; then
+            continue
+          fi
+          echo "image not present locally, pulling $one"
+          if ! docker pull "$one"; then
+            echo "ERROR: cannot pull $one" >&2
+            echo "Set RISCV_IMAGE / RISCV_TEST_IMAGE to reachable images (see the" >&2
+            echo "toolchain-image workflow), or build them locally:" >&2
             echo "  docker build -f docker/riscv64-toolchain.Dockerfile -t npm-riscv64/toolchain:riscv64 ." >&2
             exit 1
           fi
-        fi
+        done
         mkdir -p "$GITHUB_WORKSPACE/.container-home"
         docker run --rm --platform linux/riscv64 "$image" uname -m
 
@@ -76,12 +91,13 @@ runs:
           -e SRC_DIR=src \
           "$image" bash "/w/.rendered/action/steps/build.sh"
 
-    # 4/5 - test: also asserts the artifact really is a RISC-V object.
+    # 4/5 - test: runs on the target CPU even for a cross recipe, and also asserts
+    # the artifact really is a RISC-V object.
     - name: test
       shell: bash
       run: |
         set -euo pipefail
-        image="${RISCV_IMAGE:-npm-riscv64/toolchain:riscv64}"
+        image="${RISCV_TEST_IMAGE:-${RISCV_IMAGE:-npm-riscv64/toolchain:riscv64}}"
         docker run --rm --platform linux/riscv64 \
           --user "${RISCV_DOCKER_USER:-$(id -u):$(id -g)}" \
           -e HOME=/w/.container-home -e npm_config_cache=/w/.container-home/.npm \

@@ -270,6 +270,23 @@ def verify_recipes(targets: list[rl.Target]) -> list[str]:
     return problems
 
 
+def target_payload(target: "rl.Target", stat: dict) -> dict:
+    """Describe one matrix entry: everything build.yml needs to run this recipe."""
+    glob = str((stat.get("artifacts") or {}).get("path") or "")
+    return {
+        "pkg": target.pkg,
+        "ver": target.ver,
+        "dir": target.path.as_posix(),
+        "slug": f"{target.slug_pkg}/{target.slug_ver}",
+        "artifact": target.artifact_name,
+        # Which images the job needs: a cross recipe builds on amd64 and tests on
+        # riscv64, so the workflow pulls two images instead of one.
+        "toolchain": rl.toolchain_kind(stat),
+        "artifact_glob": glob,
+        "artifact_dir": str(Path(glob).parent).replace("\\", "/") if glob else "",
+    }
+
+
 def main(cwd: Path | None = None) -> int:
     cwd = Path(cwd or Path.cwd())
     root_option = os.environ.get("RECIPE_ROOT", DEFAULT_ROOT)
@@ -330,18 +347,7 @@ def main(cwd: Path | None = None) -> int:
         except rl.RecipeError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
-        glob = str((stat.get("artifacts") or {}).get("path") or "")
-        payload.append(
-            {
-                "pkg": t.pkg,
-                "ver": t.ver,
-                "dir": t.path.as_posix(),
-                "slug": f"{t.slug_pkg}/{t.slug_ver}",
-                "artifact": t.artifact_name,
-                "artifact_glob": glob,
-                "artifact_dir": str(Path(glob).parent).replace("\\", "/") if glob else "",
-            }
-        )
+        payload.append(target_payload(t, stat))
     compact = json.dumps(payload, separators=(",", ":"))
     # publish is only allowed after the merge lands on the default branch (D5).
     publish = "true" if (event == "push" and payload) else "false"

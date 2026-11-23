@@ -47,7 +47,7 @@ const path=require("node:path");
 const args=process.argv.slice(1);
 const dir=args[0], name=args[1], version=args[2], mode=args[3];
 const reqName=args[4]||"", reqVersion=args[5]||"", mainFile=args[6]||"";
-const osName=args[7]||"", cpuName=args[8]||"";
+const osName=args[7]||"", cpuName=args[8]||"", registryUrl=args[9]||"";
 const file=path.join(dir, "package.json");
 const exists=fs.existsSync(file);
 if (mode === "verify") {
@@ -69,6 +69,16 @@ if (mode === "verify") {
     console.error("[publish] " + reqName + " must be pinned to " + reqVersion + " in optionalDependencies");
     process.exit(1);
   }
+  // A manifest that pins a different registry would publish outside the intent of
+  // the recipe, and --registry cannot override publishConfig (see generate mode).
+  // (No apostrophes here: this JavaScript is embedded in a single-quoted shell string.)
+  if (registryUrl && pkg.publishConfig && pkg.publishConfig.registry
+      && String(pkg.publishConfig.registry).replace(/\/+$/, "") !== registryUrl.replace(/\/+$/, "")) {
+    console.error("[publish] " + file + " pins publishConfig.registry=" + pkg.publishConfig.registry
+      + " but this recipe publishes to " + registryUrl);
+    console.error("[publish] npm prefers publishConfig over --registry; align the manifest or let the renderer generate it (generate_manifest: true)");
+    process.exit(1);
+  }
   process.exit(0);
 }
 if (mode !== "generate" && mode !== "verify") {
@@ -85,9 +95,18 @@ if (reqName) {
   pkg.optionalDependencies = pkg.optionalDependencies || {};
   pkg.optionalDependencies[reqName] = reqVersion;
 }
+// npm gives publishConfig.registry precedence over the --registry flag, so an
+// upstream manifest that pins its own registry would silently send the tarball
+// somewhere else. The registry from the recipe is the single source of truth (D13).
+if (registryUrl && pkg.publishConfig && pkg.publishConfig.registry
+    && String(pkg.publishConfig.registry).replace(/\/+$/, "") !== registryUrl.replace(/\/+$/, "")) {
+  console.log("[publish] publishConfig.registry " + pkg.publishConfig.registry
+    + " -> " + registryUrl + " (the recipe decides where this package goes)");
+  pkg.publishConfig.registry = registryUrl;
+}
 fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");
 console.log("[publish] wrote " + file + " (" + mode + ")");
-' "$dir" "$name" "$version" "$mode" "$req_name" "$req_version" "$main_file" "$os_name" "$cpu_name"
+' "$dir" "$name" "$version" "$mode" "$req_name" "$req_version" "$main_file" "$os_name" "$cpu_name" "$registry"
   if npm view "$name@$version" version --registry "$registry" >/dev/null 2>&1; then
     log "already published: $name@$version (skipped)"
     return 0

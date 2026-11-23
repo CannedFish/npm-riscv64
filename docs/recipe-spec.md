@@ -50,6 +50,14 @@ npm:
   version: 1.0.0         # resolve dist.tarball and dist.integrity
   registry: https://registry.npmjs.org
 
+# How the recipe is built. Omitted = native.
+#   native - fetch/patch/build/test run inside a riscv64 container (qemu)
+#   cross  - fetch/patch/build run in an amd64 container holding the riscv64 cross
+#            toolchain (rustc + riscv64-linux-gnu gcc); only the test step runs
+#            inside the riscv64 container, so the artifact is still executed on
+#            the target CPU
+toolchain: native        # native | cross
+
 artifacts:
   path: prebuilds/linux-riscv64/*.node    # glob, relative to the source root
 
@@ -73,6 +81,7 @@ Validation (the renderer refuses to build otherwise):
 | every `npm_publish` entry needs `name` and `dir` | publishing an unnamed or unrooted package is meaningless |
 | `role: binary` entries need `os` and `cpu` | that is what makes npm pick the right optional dependency |
 | a `requires` entry must name another `npm_publish` entry of the same recipe, at the same version | a renamed dependency must not be silently accepted |
+| `toolchain` must be `native` or `cross` | the action only knows how to run those two build models |
 | package directories must not be empty | an empty directory is a half-finished recipe, not a recipe |
 
 ## 3. `commands/` snippets
@@ -154,6 +163,17 @@ For every entry:
 published under a second name. With `generate_manifest: true`, a rename is a
 deliberate re-brand and is allowed.
 
+`publishConfig.registry` in the manifest is overridden to win over `--registry`:
+npm gives `publishConfig` precedence, so an upstream manifest that pins its own
+registry would send the tarball somewhere the recipe never asked for. In `generate`
+mode the renderer rewrites it to the recipe's registry (logged, `publishConfig.access`
+is kept); in `verify` mode a disagreement is a hard failure, because a manifest the
+renderer may not edit must not be silently published elsewhere.
+
+Large packages need a registry that accepts them: verdaccio's default
+`max_body_size` is 10 MB, so an L2 rehearsal of a package carrying a native binding
+needs `max_body_size: 100mb` in its config.
+
 ## 7. What the renderer generates
 
 ```bash
@@ -171,6 +191,20 @@ Generated variables available in the template: `pkg.name`, `pkg.dirname`,
 `pkg.target`, `recipe.dir`, `src.dir`, `steps.dir`, `has.patches`, plus every
 scalar from `.stat` flattened with dots (`upstream.repo`, `upstream.subdir`,
 `npm_publish.0.registry`, …).
+
+The toolchain adds its own variables, so a recipe never has to spell out where
+the steps run:
+
+| Variable | native | cross |
+| --- | --- | --- |
+| `job.toolchain`, `job.cross` | `native`, false | `cross`, true |
+| `build.platform`, `build.image`, `build.dockerfile` | `linux/riscv64`, `npm-riscv64/toolchain:riscv64`, `docker/riscv64-toolchain.Dockerfile` | `linux/amd64`, `npm-riscv64/toolchain:cross`, `docker/riscv64-cross.Dockerfile` |
+| `test.platform`, `test.image` | `linux/riscv64`, the riscv64 image | `linux/riscv64`, the riscv64 image |
+| `riscv.triple` | `riscv64gc-unknown-linux-gnu` (passed to the build step only for cross) | same |
+
+Two images can therefore be involved in one job: `RISCV_IMAGE` is the build image
+and `RISCV_TEST_IMAGE` the test image (unset ⇒ the same image). The cross image is
+pulled only by the cross recipes that need it.
 
 Template features:
 
@@ -302,8 +336,17 @@ to a full build.
 | L1 | `python3 tests/run_action_locally.py --pkg @ruyisdk/bufferutil --ver 4.2.0` | the rendered action really fetches, builds and tests under riscv64 emulation |
 | L2 | `python3 tests/l2_publish.py` | publish order, idempotency, manifest merge, identity, partial-failure re-entry against verdaccio |
 
-L1 and L2 need docker. L1 uses the riscv64 toolchain image: it takes a local image
-when one exists and otherwise pulls `RISCV_IMAGE`. In CI the image is published once
+L1 and L2 need docker. L1 uses the toolchain images: `--image` (or `RISCV_IMAGE`)
+is the build image and `--test-image` (or `RISCV_TEST_IMAGE`) the test image, so a
+cross recipe is reproduced the way CI runs it - e.g.
+
+```bash
+RISCV_IMAGE=npm-riscv64/toolchain:cross \
+RISCV_TEST_IMAGE=npm-riscv64/toolchain:riscv64 \
+python3 tests/run_action_locally.py --pkg @ruyisdk/rolldown --ver 1.3.3
+```
+
+It takes a local image when one exists and otherwise pulls it. In CI the image is published once
 by the `toolchain-image` workflow and pulled per run - building it per run costs
 minutes of emulated package installs and can silently succeed without producing a
 local image. Set `RISCV_IMAGE` to override the image and `NPM_REGISTRY` to point

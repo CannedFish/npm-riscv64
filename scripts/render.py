@@ -41,6 +41,11 @@ DEFAULT_TEMPLATE = ".github/templates/action.template.yml"
 DEFAULT_ROOT = "packages"
 SRC_DIR = "src"
 
+#: The Rust target triple a cross recipe builds for. Cargo spells the linker /
+#: compiler environment variables after it, and Cargo.toml-level tooling expects
+#: the same spelling.
+RISCV_TARGET_TRIPLE = "riscv64gc-unknown-linux-gnu"
+
 
 class RenderError(Exception):
     pass
@@ -331,7 +336,7 @@ const path=require("node:path");
 const args=process.argv.slice(1);
 const dir=args[0], name=args[1], version=args[2], mode=args[3];
 const reqName=args[4]||"", reqVersion=args[5]||"", mainFile=args[6]||"";
-const osName=args[7]||"", cpuName=args[8]||"";
+const osName=args[7]||"", cpuName=args[8]||"", registryUrl=args[9]||"";
 const file=path.join(dir, "package.json");
 const exists=fs.existsSync(file);
 if (mode === "verify") {
@@ -353,6 +358,16 @@ if (mode === "verify") {
     console.error("[publish] " + reqName + " must be pinned to " + reqVersion + " in optionalDependencies");
     process.exit(1);
   }
+  // A manifest that pins a different registry would publish outside the intent of
+  // the recipe, and --registry cannot override publishConfig (see generate mode).
+  // (No apostrophes here: this JavaScript is embedded in a single-quoted shell string.)
+  if (registryUrl && pkg.publishConfig && pkg.publishConfig.registry
+      && String(pkg.publishConfig.registry).replace(/\/+$/, "") !== registryUrl.replace(/\/+$/, "")) {
+    console.error("[publish] " + file + " pins publishConfig.registry=" + pkg.publishConfig.registry
+      + " but this recipe publishes to " + registryUrl);
+    console.error("[publish] npm prefers publishConfig over --registry; align the manifest or let the renderer generate it (generate_manifest: true)");
+    process.exit(1);
+  }
   process.exit(0);
 }
 if (mode !== "generate" && mode !== "verify") {
@@ -368,6 +383,15 @@ if (cpuName) { pkg.cpu = [cpuName]; }
 if (reqName) {
   pkg.optionalDependencies = pkg.optionalDependencies || {};
   pkg.optionalDependencies[reqName] = reqVersion;
+}
+// npm gives publishConfig.registry precedence over the --registry flag, so an
+// upstream manifest that pins its own registry would silently send the tarball
+// somewhere else. The registry from the recipe is the single source of truth (D13).
+if (registryUrl && pkg.publishConfig && pkg.publishConfig.registry
+    && String(pkg.publishConfig.registry).replace(/\/+$/, "") !== registryUrl.replace(/\/+$/, "")) {
+  console.log("[publish] publishConfig.registry " + pkg.publishConfig.registry
+    + " -> " + registryUrl + " (the recipe decides where this package goes)");
+  pkg.publishConfig.registry = registryUrl;
 }
 fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");
 console.log("[publish] wrote " + file + " (" + mode + ")");
@@ -455,7 +479,7 @@ def generate_publish(stat: dict, target: rl.Target, artifact_glob: str) -> str:
         '  local abs_dir',
         '  abs_dir=$(cd "$dir" && pwd) || { log "cannot enter $dir"; return 1; }',
         "  node -e '" + MANIFEST_JS + "' \"$dir\" \"$name\" \"$version\" \"$mode\" "
-        '"$req_name" "$req_version" "$main_file" "$os_name" "$cpu_name"',
+        '"$req_name" "$req_version" "$main_file" "$os_name" "$cpu_name" "$registry"',
         '  if npm view "$name@$version" version --registry "$registry" >/dev/null 2>&1; then',
         '    log "already published: $name@$version (skipped)"',
         "    return 0",
@@ -555,6 +579,21 @@ def build_variables(
     ):
         variables.setdefault(key, "")
 
+    # Which toolchain the recipe asks for decides where the steps run: a native
+    # recipe builds and tests inside the riscv64 container (qemu), a cross recipe
+    # builds on the host architecture with a riscv64 cross toolchain and tests in
+    # the riscv64 container, so the artifact is still exercised on its own CPU.
+    cross = rl.toolchain_kind(stat) == rl.TOOLCHAIN_CROSS
+    if cross:
+        build_platform = "linux/amd64"
+        build_image = "npm-riscv64/toolchain:cross"
+        build_dockerfile = "docker/riscv64-cross.Dockerfile"
+        test_image = "npm-riscv64/toolchain:riscv64"
+    else:
+        build_platform = "linux/riscv64"
+        build_image = test_image = "npm-riscv64/toolchain:riscv64"
+        build_dockerfile = "docker/riscv64-toolchain.Dockerfile"
+
     main_name = rl.main_publish_name(stat, target.pkg)
     variables.update(
         {
@@ -570,6 +609,14 @@ def build_variables(
             "src.dir": SRC_DIR,
             "steps.dir": steps_dir,
             "has.patches": bool(layers.patches),
+            "job.cross": cross,
+            "job.toolchain": rl.toolchain_kind(stat),
+            "build.platform": build_platform,
+            "build.image": build_image,
+            "build.dockerfile": build_dockerfile,
+            "test.platform": "linux/riscv64",
+            "test.image": test_image,
+            "riscv.triple": RISCV_TARGET_TRIPLE,
         }
     )
 

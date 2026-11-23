@@ -69,19 +69,35 @@ jobs:
       # building it in every matrix job costs minutes of emulated apt installs and
       # can silently produce nothing (buildx keeps the result in its cache unless
       # the build is pushed or loaded).
+      # The recipe chooses its toolchain (native or cross). A cross recipe builds in
+      # the amd64 image and tests in the riscv64 one, so both have to be resolved
+      # and pulled here; the action reads them as RISCV_IMAGE / RISCV_TEST_IMAGE.
       - name: Resolve toolchain image
         env:
           IMAGE_OVERRIDE: ${{ vars.RISCV_IMAGE }}
+          CROSS_OVERRIDE: ${{ vars.RISCV_CROSS_IMAGE }}
+          TOOLCHAIN: ${{ matrix.target.toolchain }}
         run: |
           set -euo pipefail
-          if [ -n "${IMAGE_OVERRIDE:-}" ]; then
-            image="$IMAGE_OVERRIDE"
+          # GHCR rejects uppercase repository names, so lowercase the owner.
+          owner_image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/npm-riscv64-toolchain"
+          native_image="${IMAGE_OVERRIDE:-$owner_image:riscv64}"
+          if [ -n "${CROSS_OVERRIDE:-}" ]; then
+            cross_image="$CROSS_OVERRIDE"
+          elif [ -n "${IMAGE_OVERRIDE:-}" ]; then
+            # Follow a custom registry by swapping the tag of the native image.
+            cross_image="${IMAGE_OVERRIDE%:*}:cross"
           else
-            # GHCR rejects uppercase repository names, so lowercase the owner.
-            image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/npm-riscv64-toolchain:riscv64"
+            cross_image="$owner_image:cross"
           fi
-          echo "RISCV_IMAGE=$image" >> "$GITHUB_ENV"
-          echo "toolchain image: $image"
+          if [ "${TOOLCHAIN:-native}" = "cross" ]; then
+            echo "RISCV_IMAGE=$cross_image" >> "$GITHUB_ENV"
+            echo "RISCV_TEST_IMAGE=$native_image" >> "$GITHUB_ENV"
+            echo "toolchain: cross (build $cross_image, test $native_image)"
+          else
+            echo "RISCV_IMAGE=$native_image" >> "$GITHUB_ENV"
+            echo "toolchain: native ($native_image)"
+          fi
 
       # Only authenticate when a token is actually supplied. Docker never falls
       # back to anonymous once credentials exist for a registry, and the
@@ -100,17 +116,21 @@ jobs:
           fi
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Pull toolchain image
+      - name: Pull toolchain images
         run: |
           set -euo pipefail
-          if ! docker pull "$RISCV_IMAGE"; then
-            echo "ERROR: cannot pull $RISCV_IMAGE" >&2
-            echo "  public package  -> anonymous pull should work; check the tag exists" >&2
-            echo "  private package -> connect the package to this repository, or add a" >&2
-            echo "                     token with read:packages as the GHCR_TOKEN secret" >&2
-            exit 1
-          fi
-          docker image inspect "$RISCV_IMAGE" --format 'image id: {{.Id}}'
+          for image in "$RISCV_IMAGE" "${RISCV_TEST_IMAGE:-}"; do
+            [ -n "$image" ] || continue
+            echo "pulling $image"
+            if ! docker pull "$image"; then
+              echo "ERROR: cannot pull $image" >&2
+              echo "  public package  -> anonymous pull should work; check the tag exists" >&2
+              echo "  private package -> connect the package to this repository, or add a" >&2
+              echo "                     token with read:packages as the GHCR_TOKEN secret" >&2
+              exit 1
+            fi
+            docker image inspect "$image" --format "image id: $image {{.Id}}"
+          done
 
       # Artifact reuse (D16). The key covers every input that can change the built
       # artifact - recipe, common layer, template, renderer, toolchain, image - so a
@@ -206,7 +226,12 @@ jobs:
         if: steps.reuse.outputs.hit != 'true'
         run: |
           set -euo pipefail
-          tar czf "${{ steps.cache.outputs.name }}.tar.gz" -C src --exclude=.git .
+          # Cargo's target/ is pure build scratch: on a cache hit the build is skipped
+          # and no later step reads it, while for a Rust workspace it can be several
+          # hundred megabytes of intermediates. The artifact itself is uploaded
+          # separately, above.
+          tar czf "${{ steps.cache.outputs.name }}.tar.gz" -C src \
+            --exclude=.git --exclude=./target .
           ls -lh "${{ steps.cache.outputs.name }}.tar.gz"
 
       - name: Upload build tree

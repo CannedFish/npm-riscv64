@@ -18,7 +18,7 @@
 | **D4** | `.stat` 格式 | **YAML**；`upstream > source > npm` 逐级降级 |
 | **D5** | 发布时机 | build/test 在 PR；publish 在合入 main 后 |
 | **D6** | 安全边界 | fork PR 不给 secrets；不用 `pull_request_target` 跑 PR 代码 |
-| **D7** | 构建载体 | **qemu 容器，固定在 template 内** |
+| **D7** | 构建载体 | **容器，固定在 template 内**；默认 qemu/riscv64（native）。2026-11-23 修订：新增 `cross` 型（amd64 交叉工具链构建 + riscv64 容器只跑测试），理由见 D26 |
 | **D8** | rolldown | 仅占位（**已决定删除该目录**，见 D20） |
 | **D9** | `scripts/**` 变更 | 仅渲染自检（2026-11-19 修订：同时把渲染器视为**全局构建输入**，配方先入候选、再按 base/head 的构建 key 差异收窄，见 §13.11） |
 | **D10** | 矩阵限流 | `max-parallel: 3~4` |
@@ -47,6 +47,7 @@
 | **D23** | Q-b | B 包同理：`generate_manifest: true` 且配方未提供 `publish` 时，渲染器**基于已有 `package.json` 更新生成**（不是从零创建），其余字段原样保留 |
 | **D24** | Q-c / Q-d / Q-e | 采纳草案建议：发布演练先 verdaccio 再真发；只有 A 无 B 合法；首包 `bufferutil`（需严格纯 C 时换 `node-expat`） |
 | **D25** | Q-f | **包名即身份**：update 模式下清单 `name` 与 `.stat` 不一致一律**失败**，不覆盖、不补齐。理由：改名发出去的不是「更新」而是「另一个包」，原包使用者拿不到 riscv64 支持 —— 与「让开发者无感获得 riscv64 支持」直接相悖。`version` 相反，由 `.stat` 决定并写入 |
+| **D26** | Q-rolldown | **工具链两型**：`toolchain: native`（默认，qemu 容器里编译，D7 原义）与 `toolchain: cross`（amd64 镜像里交叉编译 riscv64，**测试仍在 riscv64 容器**）。选择依据是实测：rolldown 的 Rust 工作区交叉编译 3m21s 出 19 MB 绑定，而同一份源码在 qemu 下 10 分钟连一个 crate 都没编译完（§13.12）。交叉不牺牲验证强度——产物必须在目标 CPU 上真实加载并打包一次 JS |
 
 ### 0.4 规范（N1）
 
@@ -479,7 +480,7 @@ publish_one <B.dir> ...
 | ID | 风险 | 备选 |
 |---|---|---|
 | R-a | `docker/setup-qemu-action` 在托管 runner 上的 riscv64 支持 | 镜像内置 qemu-user-static + `--platform` |
-| R-b | qemu 模拟性能（5–20×），Rust 包可能逼近 6h | 首包选纯 C（D14）；Rust 推迟到自建 runner |
+| R-b | qemu 模拟性能（5–20×），Rust 包可能逼近 6h | 首包选纯 C（D14）；**2026-11-23 修订**：Rust 包不再等自建 runner——改走 cross（D26/§13.12） |
 | R-c | `dist.tarball` 指向 CDN/私有镜像 | `.stat` 用显式 `source.url` 覆盖 |
 | R-d | artifact 被清理 / PR 未跑过构建 | §5.1 回退重建 |
 | R-e | 复用产物基于 PR head 树而非合并树 | §5.1 有效性校验 diff |
@@ -627,7 +628,7 @@ L0/L1/L2 不阻塞于环境申请，可以立即开始；L3 需要仓库就绪�
 | 3 | composite action 的步骤级 `if: inputs.publish == 'true'` 生效 | 改为在 job 级 `if` 控制，或拆一个 publish 专用 job |
 | 4 | 发布到 GitHub Packages：npm scope 必须等于仓库 owner（`CannedFish/npm-riscv64` → `@cannedfish/*`） | 仓库变量 `PUBLISH_SCOPE=cannedfish`（渲染器 `--publish-scope` 会连同 `requires` 一起改写），配方保持 `@ruyisdk/*`；已连线 |
 | 5 | `permissions: packages: write` + `GITHUB_TOKEN` 是否足够发布 | 退到 PAT（`secrets.NPM_TOKEN`），`token_env` 已支持任意变量名；首跑可用仓库变量 `SKIP_PUBLISH=true` 先只验构建 |
-| 6 | qemu 模拟下 `bufferutil` 的真实耗时（R-b） | 纯 C 首包已是最省；Rust 包推迟到自建 runner |
+| 6 | qemu 模拟下 `bufferutil` 的真实耗时（R-b） | 纯 C 首包已是最省；Rust 包改走 cross（D26/§13.12），qemu 只承担测试 |
 | 7 | artifact 复用（S4 剩余）：`gh run download` 定位 PR 产物 + 过期判定 | 先只保留「失败即重建」的保守路径 |
 
 ### 13.6 常用命令
@@ -780,3 +781,73 @@ Dockerfile、镜像 ID、无关配方不失效、`.pyc` 忽略）；模板新增
 | 重放 PR #3 | `path_rules` 给出候选 2 条，收窄后**只剩 `@ruyisdk/utf-8-validate`**（bufferutil 报 `build inputs unchanged (key bb563c29406f), skipping`） |
 | L0 | 86 个用例通过（`test_build_key` 27、`test_detect` 18，新增「收窄」与「哪些编辑不该动 key」两组） |
 | L1 + 复用 | utf-8-validate 真构建 2m05s → key `800d52552cdb`（两次计算一致）→ 打包 6.6 MB → 恢复到新沙箱 `--reuse`：fetch/build skipped、test 通过、publish `+ @ruyisdk/utf-8-validate@6.0.6` |
+
+### 13.12 第三个配方：`@ruyisdk/rolldown` 1.3.3 与 `cross` 工具链（2026-11-23）
+
+**任务**：前两个包（`bufferutil`、`utf-8-validate`）都是「源码不用动、qemu 里直接编译」就成功；
+rolldown 预期是要打补丁才能出 riscv64 二进制的案例。实测结论比预期乐观：**源码一行不用改**，
+真正卡住的是**构建载体**而不是源码。
+
+**上游现状（逐条实测）**：
+
+| 事实 | 证据 |
+|---|---|
+| 上游不产 riscv64 绑定 | `napi.targets` 无 riscv64；npm 上 `@rolldown/binding-linux-riscv64-gnu@0.0.0` 是空占位（16 个平台包齐全，独缺 riscv64） |
+| 加载器**已经**支持 riscv64 | 发布包 `dist/shared/binding-*.mjs` 里就有 riscv64 分支：先 `require('./rolldown-binding.linux-riscv64-gnu.node')`，再退到 `@rolldown/binding-linux-riscv64-gnu` |
+| 打包过滤不会漏掉它 | `files: ["dist", ..., "!dist/*.node"]`：`!dist/*.node` 只匹配 `dist/` 第一层，`dist/shared/*.node` **会**被打进 tarball |
+| Rust 源码在 riscv64 上零错误 | `cargo build --release -p rolldown_binding --target riscv64gc-unknown-linux-gnu`（rustc 1.100.0 + 交叉 gcc 12.2.0）：3m21s（16 核）出 19 MB `stripped` RISC-V ELF，无报错无 riscv 相关警告 |
+| 功能可用 | 上游 `dist/` + 我们的 `.so` 改名为 `dist/shared/rolldown-binding.linux-riscv64-gnu.node` → 在 riscv64（qemu，node 20.19.2）里真打包一个 JS 模块，输出正确 |
+
+**真正的约束：JS glue 无法在 riscv64 上重建。** `dist/` 由 `@oxc-node/core` 驱动、并且要先用
+rolldown 自己来打包自己（自举）；而 `@oxc-node/core` 的 16 个平台包里**没有 riscv64**。所以复用上游
+已发布的 npm tarball 是唯一可行且更忠实的做法：JS 部分与上游逐字节相同，只有原生绑定是本仓库构建的。
+代价是这条配方的 `fetch` 变成**双来源**（git 取 Rust 源码 + 按 sha512 钉住的 npm tarball 取 JS 外壳），
+配方自带 `commands/fetch` 覆盖生成版（D13 的「配方覆盖」机制天然支持）。
+
+**为什么需要 cross（D26）**：同一份源码在 qemu/riscv64 容器里，10 分钟连 `target/release/deps`
+都没出现一个文件（每次 `rustc` 调用要几分钟）；rolldown 有数百个 crate，照此推算要数小时，
+逼近 GitHub 单 job 6h 上限。交叉编译 3-4 分钟出活。**测试仍在 riscv64 容器里跑**——交叉只搬走
+编译，不搬走验证：
+
+| 阶段 | native | cross |
+|---|---|---|
+| fetch / patch / build | riscv64 容器（qemu） | amd64 容器（交叉工具链），镜像 `RISCV_IMAGE` |
+| test | 同上 | riscv64 容器，镜像 `RISCV_TEST_IMAGE` |
+
+`.stat` 加一个 `toolchain: native|cross` 字段（缺省 native，老配方**渲染结果不变**），
+渲染器据此给出 `build.platform` / `build.image` / `build.dockerfile` / `test.*` / `riscv.triple`
+变量，模板只引用变量，`{{#if job.cross}}` 只多出一段「交叉工具链自检」。新增镜像
+`docker/riscv64-cross.Dockerfile`（amd64 + rustup 钉 1.100.0 + `riscv64-linux-gnu-gcc` + cmake），
+`toolchain-image` 工作流改成矩阵一次推两型（`:riscv64` 与 `:cross`）。
+
+**验证（本机实测）**：
+
+| 检查 | 结果 |
+|---|---|
+| 交叉镜像自检 | `rustc 1.100.0`、`riscv64gc-unknown-linux-gnu` 已装、`riscv64-linux-gnu-gcc 12.2.0` |
+| L1 全链（cross） | fetch（git + npm 双源，tarball 过 sha512）→ build **3m13s** → binding 19 MB RISC-V → test：`npm pack` 断言「tarball 会带 `dist/shared/rolldown-binding.linux-riscv64-gnu.node`」（59 文件 / 20.5 MB 未压缩）→ 在 riscv64 上 `rolldown()` 打包成功（`[test] bundled on riscv64 with node v20.19.2`） |
+| 老配方未受影响 | 模板改动后 bufferutil 的 **key 仍是 `bb563c29406f`**（渲染出的 fetch/build 命令逐字节不变）→ CI 不会重建，只跑 test/publish。这正是 §13.11「按渲染命令计 key」的直接收益 |
+| L0 | 92 个用例通过（新增 toolchain 渲染/校验、detect payload、`.stat` 校验 6 例） |
+
+**踩到的两个坑（都已写进配方注释）**：
+
+1. 交叉镜像缺 `cmake`：rolldown 的分配器 `libmimalloc-sys2` 用 CMake 编 mimalloc C 源码，
+   报错只有一句 `is cmake not installed?`。补进镜像后在镜像构建期就固定下来。
+2. **上游清单的 `publishConfig.registry` 会压过 `--registry`**：rolldown 的清单钉了
+   `https://registry.npmjs.org/`，于是 `npm publish` 无视配方给的 registry 直奔 npmjs——第一次
+   L2 演练就是这样失败（`ENEEDAUTH ... registry.npmjs.org`）。这是**发布机制的通用缺陷**，不是本配方
+   独有：任何带 `publishConfig` 的上游清单都会踩。改法是发布生成器统一处理——`generate` 模式把
+   `publishConfig.registry` 改写为配方 registry（保留 `access`，并打日志），`verify` 模式发现不一致
+   直接**硬失败**（渲染器无权改的清单不能被悄悄发到别处）。修完 L2 演练通过：
+   `+ @ruyisdk/rolldown@1.3.3`，verdaccio 里的 tarball 含 19.5 MB 绑定。
+3. `npm pack` / `npm install` 的**位置参数**会被当成包名解析：`npm pack out/rolldown` 会去
+   `git ls-remote ssh://git@github.com/out/rolldown.git`（`out/rolldown` 被读成 GitHub 简写
+   owner/repo）。配方里改成先 `cd` 进目录再执行。
+
+**消费者视角复验**（用 verdaccio 里**已发布的 tarball**，不是构建树）：在 riscv64 容器里
+`npm install rolldown-1.3.3.tgz --omit=optional` → `added 3 packages` → `import { rolldown } from
+"@ruyisdk/rolldown"` → 打包成功（`consumer arch=riscv64`）。即「发出去的包」本身可用。
+
+**已知限制**：cross 镜像里没有 riscv64 的 C 库/头文件，所以「Rust 之外还依赖系统 C 库」的包不能走
+cross（要么回到 native，要么给镜像加 `dpkg --add-architecture riscv64` 与对应 `-dev` 包）；本轮
+rolldown 只需要交叉 gcc 做链接，不涉及该限制。

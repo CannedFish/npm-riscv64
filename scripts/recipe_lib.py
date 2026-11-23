@@ -27,6 +27,14 @@ STAT_FILE = ".stat"
 DISABLE_FILE = ".disable"
 ROLES = ("binary", "main")
 
+#: How the recipe is built. A native recipe compiles inside a riscv64
+#: container (qemu); a cross recipe compiles on the host architecture with a
+#: riscv64 cross toolchain and is then tested in the riscv64 container.
+TOOLCHAIN_NATIVE = "native"
+TOOLCHAIN_CROSS = "cross"
+TOOLCHAIN_KINDS = (TOOLCHAIN_NATIVE, TOOLCHAIN_CROSS)
+DEFAULT_TOOLCHAIN = TOOLCHAIN_NATIVE
+
 #: Reference names that move and therefore cannot pin a source tree.
 MUTABLE_REFS = frozenset(
     {"main", "master", "develop", "dev", "head", "latest", "trunk", "next"}
@@ -146,6 +154,12 @@ def find_target(root: Path, pkg: str, ver: str) -> Target:
 # --------------------------------------------------------------------------
 
 
+def toolchain_kind(stat: dict) -> str:
+    """Return the toolchain a recipe asks for (native when unspecified)."""
+    value = str(stat.get("toolchain") or DEFAULT_TOOLCHAIN).strip().lower()
+    return value if value in TOOLCHAIN_KINDS else DEFAULT_TOOLCHAIN
+
+
 def load_stat(target: Target) -> dict:
     """Load and minimally shape ``.stat``."""
     stat_path = target.path / STAT_FILE
@@ -229,6 +243,13 @@ def validate_stat(target: Target, stat: dict) -> list[str]:
 
     if not artifacts.get("path"):
         problems.append("artifacts.path is required (glob of the built artifact)")
+
+    raw_toolchain = stat.get("toolchain")
+    if raw_toolchain is not None and str(raw_toolchain).strip().lower() not in TOOLCHAIN_KINDS:
+        problems.append(
+            f"toolchain '{raw_toolchain}' is not supported; use one of {TOOLCHAIN_KINDS} "
+            f"(omit the field for the default '{DEFAULT_TOOLCHAIN}')"
+        )
 
     if not isinstance(publish, list) or not publish:
         problems.append(

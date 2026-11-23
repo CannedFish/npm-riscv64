@@ -1,0 +1,84 @@
+#!/bin/bash
+# Runs on riscv64 (the test image), unlike the build step which runs on amd64: the
+# point of this step is that the cross-built binding actually loads and bundles
+# JavaScript on the target CPU.
+#
+# Three things are checked:
+#   1. the artifact is a riscv64 object (the build asserted it too, from the other
+#      side of the cross build);
+#   2. npm would actually ship it - the wrapper's manifest lists files and excludes
+#      "dist/*.node", which only matches direct children of dist/, so the binding in
+#      dist/shared/ survives. If upstream tightens that pattern the package silently
+#      loses its binding, and this is where it shows up;
+#   3. the public API works: bundle a small module and inspect the output.
+set -euo pipefail
+
+WRAPPER="out/rolldown"
+BINDING="$WRAPPER/dist/shared/rolldown-binding.linux-riscv64-gnu.node"
+
+test -f "$BINDING" || {
+  echo "ERROR: missing $BINDING (the build step places it there)" >&2
+  exit 1
+}
+if ! file -b "$BINDING" | grep -q "RISC-V"; then
+  echo "ERROR: $BINDING is not a RISC-V object:" >&2
+  file "$BINDING" >&2
+  exit 1
+fi
+echo "[test] artifact: $(file -b "$BINDING" | cut -d, -f1-3)"
+
+# Same trap as npm install below: a positional path is read as a package spec
+# (`out/rolldown` parses as the GitHub shorthand owner/repo), so pack from inside.
+(
+  cd "$WRAPPER"
+  npm pack --dry-run --json --ignore-scripts > .pack.json
+)
+node - "$WRAPPER" <<'JS'
+const fs = require("node:fs");
+const wrapper = process.argv[2];
+const report = JSON.parse(fs.readFileSync(`${wrapper}/.pack.json`, "utf8"));
+const files = (report[0].files || []).map((f) => f.path);
+const wanted = "dist/shared/rolldown-binding.linux-riscv64-gnu.node";
+if (!files.includes(wanted)) {
+  console.error(`[test] npm would pack a wrapper without ${wanted}; ${files.length} files, no .node among them`);
+  process.exit(1);
+}
+console.log(`[test] npm would ship ${wanted} (${report[0].entryCount} files, ${report[0].unpackedSize} bytes unpacked)`);
+JS
+rm -f "$WRAPPER/.pack.json"
+
+# The wrapper's runtime dependencies are pure JS and declared as dependencies, so
+# they come from the registry rather than from this build. Optional dependencies are
+# skipped: they are the per-platform binding packages, all of them for other CPUs
+# (ours lives inside this package).
+# `npm install --prefix dir` is ambiguous (the path is read as a package spec), so
+# step into the wrapper instead.
+(
+  cd "$WRAPPER"
+  npm install --omit=optional --omit=dev \
+    --no-package-lock --no-audit --no-fund --ignore-scripts >/dev/null
+)
+
+cat > "$WRAPPER/entry.js" <<'JS'
+export const answer = 42;
+const greet = (name) => `hello ${name}`;
+console.log(greet("riscv64"), answer);
+JS
+cat > "$WRAPPER/selftest.mjs" <<'JS'
+import { rolldown } from "./dist/index.mjs";
+
+// The step is only meaningful on the CPU the artifact was built for; a test image
+// that silently resolved to amd64 would otherwise pass on a wrong binary.
+if (process.arch !== "riscv64") throw new Error(`expected riscv64, running on ${process.arch}`);
+
+const bundle = await rolldown({ input: new URL("./entry.js", import.meta.url).pathname });
+const generated = await bundle.generate({ format: "esm" });
+const code = generated.output[0].code;
+if (!code.includes("hello") || !code.includes("42")) {
+  throw new Error(`unexpected bundle output:\n${code}`);
+}
+console.log(code.trim());
+console.log(`[test] bundled on ${process.arch} with node ${process.version}`);
+JS
+node "$WRAPPER/selftest.mjs"
+rm -f "$WRAPPER/entry.js" "$WRAPPER/selftest.mjs"
