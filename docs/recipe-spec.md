@@ -169,7 +169,11 @@ For every entry:
    happens (witnessed with verdaccio and `bufferutil@4.2.0`);
 4. credentials: `token_env` names an environment variable; when it is set, a line
    keyed by the **full registry URL** (path included, npm looks credentials up by the
-   URL it talks to) is written to a throwaway `.npmrc`:
+   URL it talks to) is written to a throwaway `.npmrc`. The registry URL is normalized
+   to end with `/` first: npm computes the credential key with
+   `new URL(".", registryUrl)`, so a URL without the slash loses its last path
+   segment (`.../repository/npm-local` → key `//host/repository/`) and the publish
+   pre-flight refuses with `ENEEDAUTH` without sending a request:
    `//<host>/<path>/:_authToken=${TOKEN_ENV}` for `auth: token` (the default), or
    `//<host>/<path>/:_auth=${TOKEN_ENV}` for `auth: basic`, which is what a registry
    answering `WWW-Authenticate: Basic` expects (the value is base64 `user:password`).
