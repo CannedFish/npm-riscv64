@@ -18,8 +18,11 @@ Rules:
 
 * ``packages/<pkg>/<ver>/**``      -> that (package, version)
 * ``packages/<pkg>/common/**``     -> every version of that package
-* ``<template>`` changed           -> every recipe
-* ``scripts/**`` changed           -> no build, but self-check the renderer
+* a global build input changed (the template, ``scripts/``, ``docker/``)
+  -> every recipe is a *candidate*, then narrowed by comparing the build cache keys of
+  the base commit and the head: a template edit that does not change a single executed
+  command leaves every key intact and therefore rebuilds nothing (see
+  ``narrow_by_build_inputs``). ``scripts/**`` additionally self-checks the renderer.
 """
 
 from __future__ import annotations
@@ -37,6 +40,12 @@ import recipe_lib as rl  # noqa: E402
 DEFAULT_ROOT = "packages"
 DEFAULT_TEMPLATE = ".github/templates/action.template.yml"
 ZERO_SHA = "0" * 40
+
+#: Inputs outside the recipes that can change every built artifact.
+GLOBAL_INPUT_PREFIXES = (".github/templates/", "scripts/", "docker/")
+
+#: Tool that computes the build cache key (relative to the repository root).
+BUILD_KEY_TOOL = "scripts/build_key.py"
 
 
 def git(*args: str, cwd: Path | None = None) -> str:
@@ -70,23 +79,33 @@ def changed_files(
     return [line for line in out.splitlines() if line.strip()], False
 
 
-def resolve_targets(
-    root: Path, changed: list[str], template_path: str, rebuild_all: bool
-) -> tuple[list[rl.Target], bool]:
-    """Map changed paths onto build targets; return (targets, self_check)."""
+def path_rules(
+    root: Path, changed: list[str], template_path: str, rebuild_all: bool = False
+) -> tuple[list[rl.Target], list[rl.Target], bool]:
+    """Map changed paths onto targets.
+
+    Returns ``(explicit, global_candidates, self_check)``:
+
+    * ``explicit`` - recipes whose own directory (or their ``common`` layer) changed.
+      They are always built: a new test still has to run even when the artifact would
+      be the same.
+    * ``global_candidates`` - every recipe, when a build input *outside* the recipes
+      changed (the template, the renderer, the toolchain). The caller narrows this set
+      by comparing build inputs with the base commit; the artifacts are not assumed to
+      have changed just because a template byte did.
+    * ``self_check`` - whether the renderer should be checked with ``--check-all``.
+    """
     self_check = False
-
-    if rebuild_all or template_path in changed:
-        reason = "template change" if template_path in changed else "full rebuild"
-        print(f"# {reason}: selecting every recipe", file=sys.stderr)
-        return rl.enumerate_targets(root), self_check
-
+    global_inputs = bool(rebuild_all)
     selected: dict[tuple[str, str], rl.Target] = {}
     root_prefix = root.name + "/"
 
     for path in changed:
-        if path.startswith("scripts/"):
-            self_check = True
+        if path == template_path or path.startswith(GLOBAL_INPUT_PREFIXES):
+            global_inputs = True
+            if path.startswith("scripts/"):
+                self_check = True
+            print(f"# global build input changed: {path}", file=sys.stderr)
             continue
         if not path.startswith(root_prefix):
             continue
@@ -113,7 +132,129 @@ def resolve_targets(
             continue
         selected[(pkg, ver)] = target
 
-    return [selected[key] for key in sorted(selected)], self_check
+    candidates = rl.enumerate_targets(root) if global_inputs else []
+    return [selected[key] for key in sorted(selected)], candidates, self_check
+
+
+def merge(*groups: list[rl.Target]) -> list[rl.Target]:
+    """Union of target lists, sorted and de-duplicated."""
+    selected: dict[tuple[str, str], rl.Target] = {}
+    for group in groups:
+        for target in group:
+            selected[(target.pkg, target.ver)] = target
+    return [selected[key] for key in sorted(selected)]
+
+
+def base_commit(
+    event: str,
+    base_ref: str,
+    head_sha: str,
+    before_sha: str,
+    cwd: Path | None = None,
+) -> str | None:
+    """The commit whose build inputs the change should be compared against."""
+    if event == "push":
+        if not before_sha or set(before_sha) == {"0"}:
+            return None
+        # A brand new branch has no base to compare with, only a full rebuild.
+        return before_sha
+    try:
+        return git("merge-base", f"origin/{base_ref}", head_sha, cwd=cwd).strip() or None
+    except RuntimeError:
+        return None
+
+
+def narrow_by_build_inputs(
+    root: Path,
+    template_path: str,
+    base_sha: str | None,
+    candidates: list[rl.Target],
+    cwd: Path | None = None,
+) -> list[rl.Target] | None:
+    """Keep the candidates whose build inputs differ from the base commit.
+
+    A template edit that adds an input or an ``if:`` guard changes the action but not a
+    single executed command, so the built artifact is unchanged and the cache would hit
+    anyway - rebuilding it is pure waste. Comparing the cache keys of the two revisions
+    answers exactly that question, using the same definition the cache itself relies on.
+
+    Returns ``None`` when the comparison is not possible (no base commit, no usable base
+    checkout, unreadable recipe): the caller then falls back to building everything,
+    which is what a conservative job should do.
+    """
+    if not base_sha or not candidates:
+        return None
+
+    import shutil
+    import subprocess
+    import tempfile
+
+    import build_key
+
+    cwd = Path(cwd or Path.cwd()).resolve()
+    tool = cwd / BUILD_KEY_TOOL
+    base_dir = Path(tempfile.mkdtemp(prefix="npm-riscv64-base-"))
+    try:
+        try:
+            git("worktree", "add", "--detach", str(base_dir), base_sha, cwd=cwd)
+        except RuntimeError as exc:
+            print(f"# cannot check out {base_sha[:12]}: {exc}", file=sys.stderr)
+            return None
+
+        # Prefer the tool that the base revision shipped: then a renderer change shows up
+        # as a changed key. Older bases have no tool; use ours on their tree instead.
+        base_tool = base_dir / BUILD_KEY_TOOL
+        if base_tool.is_file():
+            command_prefix = [sys.executable, str(base_tool)]
+        elif tool.is_file():
+            command_prefix = [sys.executable, str(tool)]
+        else:
+            print("# no build_key tool available to compare with", file=sys.stderr)
+            return None
+        template = str(base_dir / template_path)
+
+        kept: list[rl.Target] = []
+        for target in candidates:
+            result = subprocess.run(
+                [*command_prefix, "--root", str(base_dir), "--template", template,
+                 "--pkg", target.pkg, "--ver", target.ver],
+                capture_output=True, text=True, check=False,
+            )
+            if result.returncode != 0:
+                print(
+                    f"# {target.ident}: cannot compute the base key "
+                    f"({result.stderr.strip().splitlines()[-1:] or 'no output'}), keeping it",
+                    file=sys.stderr,
+                )
+                kept.append(target)
+                continue
+            base_key = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+            try:
+                head_key = build_key.build_key(
+                    cwd, target.pkg, target.ver, template=cwd / template_path
+                )
+            except Exception as exc:  # noqa: BLE001 - keep the recipe on any surprise
+                print(f"# {target.ident}: cannot compute the head key ({exc}), keeping it", file=sys.stderr)
+                kept.append(target)
+                continue
+            if base_key != head_key:
+                print(
+                    f"# {target.ident}: build inputs changed ({base_key or 'none'} -> {head_key})",
+                    file=sys.stderr,
+                )
+                kept.append(target)
+            else:
+                print(
+                    f"# {target.ident}: build inputs unchanged (key {head_key}), skipping",
+                    file=sys.stderr,
+                )
+        return kept
+    finally:
+        try:
+            git("worktree", "remove", "--force", str(base_dir), cwd=cwd)
+        except RuntimeError:
+            pass
+        shutil.rmtree(base_dir, ignore_errors=True)
 
 
 def verify_recipes(targets: list[rl.Target]) -> list[str]:
@@ -147,7 +288,33 @@ def main(cwd: Path | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    targets, self_check = resolve_targets(root, changed, template_path, rebuild_all)
+    explicit, candidates, self_check = path_rules(root, changed, template_path, rebuild_all)
+    targets = merge(explicit, candidates)
+    if candidates and any(path.startswith("docker/") for path in changed):
+        # The toolchain itself changed. Its effect reaches the key through the image id,
+        # which is only known after the image is rebuilt, so nothing here can be narrowed
+        # away: build everything and let the build job's key decide about the cache.
+        print(
+            "# toolchain changed: every recipe is kept, the image digest is resolved later",
+            file=sys.stderr,
+        )
+    elif candidates:
+        narrowed = narrow_by_build_inputs(
+            root,
+            template_path,
+            base_commit(event, base_ref, head_sha, before_sha, cwd=cwd),
+            candidates,
+            cwd=cwd,
+        )
+        if narrowed is None:
+            print(
+                "# no base to compare build inputs with, keeping every recipe",
+                file=sys.stderr,
+            )
+        else:
+            # Explicit changes stay: a recipe whose test or .stat changed still has to
+            # run even when its artifact would be identical.
+            targets = merge(explicit, narrowed)
 
     problems = rl.repository_problems(root) + verify_recipes(targets)
     if problems:

@@ -20,7 +20,7 @@
 | **D6** | 安全边界 | fork PR 不给 secrets；不用 `pull_request_target` 跑 PR 代码 |
 | **D7** | 构建载体 | **qemu 容器，固定在 template 内** |
 | **D8** | rolldown | 仅占位（**已决定删除该目录**，见 D20） |
-| **D9** | `scripts/**` 变更 | 仅渲染自检 |
+| **D9** | `scripts/**` 变更 | 仅渲染自检（2026-11-19 修订：同时把渲染器视为**全局构建输入**，配方先入候选、再按 base/head 的构建 key 差异收窄，见 §13.11） |
 | **D10** | 矩阵限流 | `max-parallel: 3~4` |
 
 ### 0.2 第二批（D11–D17）
@@ -32,7 +32,7 @@
 | **D13** | Q3 | `publish` 同 fetch/patch 策略：由元数据生成，配方可覆盖（具体形态见 **D18**） |
 | **D14** | Q4 | 首个真包 = 纯 C 的小原生模块 |
 | **D15** | Q5 | `source` 按**失败**处理：源码必须能定位到具体 ref |
-| **D16** | Q6 | main 侧**复用 PR artifact**，不重复构建 |
+| **D16** | Q6 | main 侧**复用 PR artifact**，不重复构建（落地为内容寻址；key 口径 2026-11-19 改为「渲染后的构建命令」，见 §13.11） |
 | **D17** | Q7 | **一条**工作流文件承载两种触发 |
 
 ### 0.3 第三批（D18–D21）
@@ -232,9 +232,10 @@ npm_publish:
 | `packages/<pkg>/common/**`（含 scoped） | 该包**全部**版本 |
 | 新增版本目录 | 该版本首次构建；缺 `.stat` → detect 阶段失败 |
 | 仅删除版本目录 | 无目标，日志提示「已下线」 |
-| `template.yml` | **全量** |
-| `scripts/**` | **仅渲染自检**（D9） |
-| 仅文档 | 无目标 |
+| `template.yml` | 全量**候选**，再按 base/head 构建 key 差异收窄（§13.11） |
+| `scripts/**` | 全量**候选** + 渲染自检；同样按 key 差异收窄（D9 修订） |
+| `docker/**` | **全量**（镜像 digest 要到构建侧才知道） |
+| 仅文档 / 仅工作流 | 无目标 |
 
 **解析规则**：`packages/` 后首段以 `@` 开头 → 包名 = 段1/段2、版本 = 段3；否则包名 = 段1、版本 = 段2。版本段为 `common` 时按上表展开。
 
@@ -268,9 +269,14 @@ npm_publish:
 ### 5.1 artifact 复用的定位链（D16）
 
 > **实现变更（2026-11-19）**：实际落地的不是下面这条「合并提交 → PR head → run」定位链，
-> 而是**内容寻址**：构建产物只由「配方 + common 层 + 模板 + 渲染器 + 工具链 + 镜像 ID」决定，
-> 把这几项哈希成 key 并写进 artifact 名，命中即等价、无需 diff 校验，也顺带覆盖直推 main 与
-> 重跑同一 commit 的情况。详见 §13.9。下面保留原始设计以备对照。
+> 而是**内容寻址**：把决定产物的输入哈希成 key 并写进 artifact 名，命中即等价、无需 diff 校验，
+> 也顺带覆盖直推 main 与重跑同一 commit 的情况。详见 §13.9。下面保留原始设计以备对照。
+>
+> **口径修订（2026-11-19 晚）**：key 不再哈希「配方 + 模板 + scripts + docker」这些**文件**，
+> 而是哈希**渲染之后真正会执行的命令**（fetch/patch/build 三个步骤的 `run` 块 + `steps/*.sh`
+> + 补丁内容 + 镜像 ID）。原因：模板加一个 `reuse` 输入或 `if:` 守卫会改文件但不会改任何一条被
+> 执行的命令，产物必然相同；旧口径却因此整册失效。同一口径也让 detect 能回答「这条配方真的受影响
+> 吗」，见 §13.11。
 
 ```
 merge_sha = github.sha
@@ -731,3 +737,46 @@ Dockerfile、镜像 ID、无关配方不失效、`.pyc` 忽略）；模板新增
 | key 敏感性 | 往 `commands/build` 末尾加一行注释 → key 从 `2de2921bfb27` 变为 `751331d8f064`；还原后回到原值 |
 
 第二个配方顺带验证了「配方内容差异不会污染 key」：两个配方的 key 不同、互不影响，改模板则两者同时失效。
+
+### 13.11 detect 按「构建输入是否真的变了」收窄（2026-11-19）
+
+**触发**：PR #3 合入后，观测到 bufferutil 明明没被这个 PR 改动，却也跟着跑了一遍
+（它在 main 上命中缓存、只跑了 test/publish，所以成本不大，但与「只构建有变更的包」的预期不符）。
+
+**根因**（两层，都已实测确认）：
+
+1. detect 的规则是「模板变更 → 全量」，而 PR #3 确实改了 `.github/templates/action.template.yml`
+   （+11 行：新增 `reuse` 输入、fetch/patch/build 三处 `if: inputs.reuse != 'true'` 守卫、几行注释）。
+   按规则它就该被选中——规则本身没坏。
+2. 旧 key 哈希的是模板**文件**，所以 key 从 `a359ecd91acc` 变成 `1f37400b0deb`，缓存未能兜住。
+   但把 base 与 head 都渲染出来对比，**实际执行的命令逐字节相同**：
+
+   | 渲染产物 | base(efc2ed7) | head(f503486) |
+   |---|---|---|
+   | 全部 `run:` 块 | `f0561413c081` | `f0561413c081` |
+   | 全部 `steps/*.sh` | `67bf97769e31` | `67bf97769e31` |
+
+   即这次重建产出与缓存里那份等价，纯属浪费。
+
+**修法（两条，配套）**：
+
+- **口径（A）**：`scripts/build_key.py` 改为哈希**渲染后的构建命令**——fetch/patch/build
+  三步的 `run` 块、`steps/{fetch,patch,build}.sh`、补丁文件内容、镜像 ID、`--extra`。
+  `test`/`publish` 片段、`.stat` 里的发布字段、模板输入与 `if:` 守卫都不再影响 key。
+  渲染由 key 自己完成（`STEPS_DIR=".rendered/action"` 固定），因此渲染器改动也会体现为命令文本变化，
+  `scripts/` 不需要单独做输入。
+- **选择（B）**：`scripts/detect_targets.py` 把全局输入（模板、`scripts/`）的变更先变成**全量候选**，
+  再用 `narrow_by_build_inputs` 比较 base 与 head 的 key：相等即跳过。base 侧优先跑**base 自己的**
+  `scripts/build_key.py`（于是渲染器改动会体现为 key 变化），base 上没有该工具时用当前工具渲染 base 树；
+  任何一步失败（没有 base commit、渲染报错、工作树不可用）都退回「全部保留」。
+  `docker/**` 例外：镜像 digest 在 detect 阶段未知，直接全量交给构建侧按 key 判定。
+  明确变更的配方（含只改 `commands/test`）永远保留——新测试必须真跑一遍。
+
+**验证（本地）**：
+
+| 检查 | 结果 |
+|---|---|
+| 新 key 对模板「无实质改动」不敏感 | 加输入 / 加 `if:` / 改注释 / 改 test 步骤 / 改 `.stat` 发布 registry → key 均不变；改 fetch、build 步骤或 upstream ref → key 变化 |
+| 重放 PR #3 | `path_rules` 给出候选 2 条，收窄后**只剩 `@ruyisdk/utf-8-validate`**（bufferutil 报 `build inputs unchanged (key bb563c29406f), skipping`） |
+| L0 | 86 个用例通过（`test_build_key` 27、`test_detect` 18，新增「收窄」与「哪些编辑不该动 key」两组） |
+| L1 + 复用 | utf-8-validate 真构建 2m05s → key `800d52552cdb`（两次计算一致）→ 打包 6.6 MB → 恢复到新沙箱 `--reuse`：fetch/build skipped、test 通过、publish `+ @ruyisdk/utf-8-validate@6.0.6` |

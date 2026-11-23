@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
-"""Content key for the build cache (see .dsh/plan.md D16).
+"""Build cache key (see .dsh/plan.md D16).
 
-A cache hit has to be trustworthy: the workflow restores a previously built
-workspace tree and skips fetch, patch and build entirely. That is only safe if the
-key covers *everything* that can change the output:
+The workflow restores a previously built workspace tree instead of building again, so
+the key has to answer one question precisely: **would this recipe produce the same
+artifact?** That is narrower than "did any file change":
 
-* the version directory (``.stat``, ``commands/``, ``patches/``),
-* the shared ``common`` layer next to it,
-* the action template (it decides the image, the flags and the step order),
-* ``scripts/`` (the renderer generates the fetch/patch snippets),
-* ``docker/`` (the toolchain itself),
-* the resolved container image id,
-* anything passed with ``--extra`` (render-time rewrites).
+* a template edit that only adds an input or an ``if:`` guard changes the action but not
+  a single executed command - the artifact is identical;
+* a ``.stat`` edit that only moves a publish target or pins another registry changes
+  nothing about the build;
+* a change to the ``test`` or ``publish`` step likewise leaves the artifact alone.
 
-A different recipe, a different commit message or a different PR cannot influence
-the built artifact, so they are deliberately absent from the key: two runs with the
-same key would have produced byte-identical trees.
+So the key hashes what actually runs, after rendering:
+
+1. the rendered ``run:`` blocks of the fetch / patch / build steps (image, mounts,
+   working directory, environment, flags),
+2. the rendered ``steps/{fetch,patch,build}.sh`` bodies (fetch and patch are generated
+   from the template and the ``.stat``; build is the recipe snippet),
+3. the patch files, which the patch step reads from the repository at run time,
+4. the resolved container image id,
+
+plus anything passed with ``--extra``. Rendering makes the key self-contained: a
+renderer change shows up as changed command text, so ``scripts/`` needs no separate
+input.
+
+A different recipe, a different commit message or a different PR cannot influence the
+built artifact, so they are deliberately absent: two runs with the same key would have
+produced equivalent trees.
 """
 
 from __future__ import annotations
@@ -24,68 +35,63 @@ import argparse
 import hashlib
 import sys
 from pathlib import Path
-from typing import Iterable, Iterator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import recipe_lib as rl  # noqa: E402
+import render  # noqa: E402
 
 #: Recipes live here, relative to the repository root.
 PACKAGES_DIR = "packages"
 
-#: Inputs outside the recipe directory that still change the built artifact.
-SHARED_INPUTS = (
-    ".github/templates",
-    "scripts",
-    "docker",
-)
+#: The default action template, relative to the repository root.
+TEMPLATE = ".github/templates/action.template.yml"
 
-#: Checked-in artefacts that never take part in a build.
-_SKIP_SUFFIXES = (".pyc", ".pyo")
+#: Where the workflow writes the rendered action. Fixed on purpose: the key must not
+#: change because a local run wrote somewhere else.
+STEPS_DIR = ".rendered/action"
 
+#: Steps whose execution produces the artifact.
+BUILD_STEPS = ("fetch upstream source", "apply patches", "build")
 
-def _iter_files(path: Path) -> Iterator[Path]:
-    if path.is_file():
-        if not path.name.endswith(_SKIP_SUFFIXES):
-            yield path
-        return
-    if not path.is_dir():
-        return
-    for entry in sorted(path.rglob("*")):
-        if entry.is_file() and not entry.name.endswith(_SKIP_SUFFIXES):
-            yield entry
+#: Scripts those steps run.
+BUILD_SCRIPTS = ("fetch", "patch", "build")
 
 
-def collect_inputs(root: Path, pkg: str, ver: str) -> list[Path]:
-    """Return the hashed files, sorted by repository-relative path."""
+def build_inputs(
+    root: Path, pkg: str, ver: str, template: Path | None = None
+) -> list[str]:
+    """Return the build-relevant text for one recipe, in a stable order."""
+    import yaml
+
     root = Path(root).resolve()
-    target = rl.find_target(root / PACKAGES_DIR, pkg, ver)
+    template = Path(template).resolve() if template else root / TEMPLATE
+    packages = root / PACKAGES_DIR
 
-    candidates: list[Path] = list(_iter_files(target.path))
-    common = target.path.parent / rl.COMMON_DIR
-    candidates.extend(_iter_files(common))
-    for relative in SHARED_INPUTS:
-        candidates.extend(_iter_files(root / relative))
+    rendered, scripts = render.render_target(
+        packages, pkg, ver, template, steps_dir=STEPS_DIR
+    )
+    action = yaml.safe_load(rendered)
 
-    # Deduplicate: a version directory can also be reached through `scripts/` style
-    # globs in future inputs, and sorting keeps the digest stable.
-    unique = {
-        path.relative_to(root).as_posix(): path
-        for path in candidates
-        if path.is_file() and path.is_relative_to(root)
-    }
-    return [unique[name] for name in sorted(unique)]
+    parts: list[str] = []
+    for step in action["runs"]["steps"]:
+        if step.get("name") in BUILD_STEPS:
+            parts.append(str(step.get("run") or ""))
+    for name in BUILD_SCRIPTS:
+        if name in scripts:
+            parts.append(scripts[name])
 
-
-def content_digest(files: Iterable[Path], root: Path) -> str:
-    root = Path(root).resolve()
-    digest = hashlib.sha256()
-    for path in files:
-        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(hashlib.sha256(path.read_bytes()).digest())
-        digest.update(b"\n")
-    return digest.hexdigest()
+    # The patch step addresses files by path, so their content has to be hashed too:
+    # the common layer applies first, then the version layer.
+    target = rl.find_target(packages, pkg, ver)
+    for directory in (target.path.parent / rl.COMMON_DIR, target.path):
+        patches = directory / "patches"
+        if not patches.is_dir():
+            continue
+        for entry in sorted(patches.iterdir()):
+            if entry.is_file():
+                parts.append(f"patches/{entry.name}\0{entry.read_text(encoding='utf-8')}")
+    return parts
 
 
 def build_key(
@@ -93,13 +99,14 @@ def build_key(
     pkg: str,
     ver: str,
     image_id: str = "",
+    template: Path | None = None,
     extra: str = "",
 ) -> str:
     """Return a short key that identifies one build configuration."""
-    root = Path(root).resolve()
-    files = collect_inputs(root, pkg, ver)
     digest = hashlib.sha256()
-    digest.update(content_digest(files, root).encode("utf-8"))
+    for part in build_inputs(root, pkg, ver, template):
+        digest.update(part.encode("utf-8"))
+        digest.update(b"\0")
     digest.update(b"\0image\0")
     digest.update(str(image_id or "").encode("utf-8"))
     digest.update(b"\0extra\0")
@@ -113,34 +120,41 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--pkg", required=True, help="package name, e.g. @scope/name")
     parser.add_argument("--ver", required=True, help="version directory name")
-    parser.add_argument("--root", default=".", help="recipe root (default: .)")
+    parser.add_argument("--root", default=".", help="repository root (default: .)")
+    parser.add_argument(
+        "--template",
+        default=None,
+        help=f"action template (default: <root>/{TEMPLATE})",
+    )
     parser.add_argument(
         "--image-id",
         default="",
-        help="resolved container image id (docker image inspect --format '{{.Id}}')",
+        help="resolved image id (docker image inspect --format '{{.Id}}')",
     )
     parser.add_argument(
         "--extra",
         default="",
-        help="additional inputs that change the build (for example render flags)",
+        help="further inputs that change the build (for example render flags)",
     )
     parser.add_argument(
         "--list",
         action="store_true",
-        help="also print the hashed inputs, one relative path per line",
+        help="also print the hashed build inputs",
     )
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()
+    template = Path(args.template) if args.template else None
     try:
-        key = build_key(root, args.pkg, args.ver, args.image_id, args.extra)
-    except rl.RecipeError as exc:
+        key = build_key(root, args.pkg, args.ver, args.image_id, template, args.extra)
+    except (rl.RecipeError, render.RenderError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
     if args.list:
-        for path in collect_inputs(root, args.pkg, args.ver):
-            print(path.relative_to(root).as_posix())
+        for part in build_inputs(root, args.pkg, args.ver, template):
+            print(f"--- {len(part)} chars ---")
+            print(part)
     print(key)
     return 0
 
