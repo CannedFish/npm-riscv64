@@ -252,6 +252,40 @@ consumer tries it:
   package, and publishing the same version again is refused by the registry as
   "already exists" (the publish step logs that as a skip).
 
+### Non-riscv64 consumers
+
+A published package is the upstream code with our riscv64 artifact added, so it also
+installs and runs on other architectures - through upstream's own paths:
+
+| consumer | `rolldown` | `bufferutil` / `utf-8-validate` |
+| --- | --- | --- |
+| linux riscv64 | our binding (`dist/shared/rolldown-binding.linux-riscv64-gnu.node`) | our prebuild (`prebuilds/linux-riscv64/`) |
+| linux x64 / arm64, macOS, Windows | upstream's optional binding package, resolved through the group repository's npmjs proxy | compiled from source by `node-gyp-build`, so a C/C++ toolchain is needed |
+
+No manifest restricts the platform (`os`/`cpu` are unset), so `npm install` on x64
+succeeds and our riscv64 artifact is simply unused there: the package is not
+riscv64-only, and x64 users do not silently get a wrong binary. Verified on an x64 host
+against the group repository - `npm i rolldown` plus a bundle runs on upstream's
+`@rolldown/binding-linux-x64-gnu`, and `npm i bufferutil utf-8-validate` compiles
+`build/Release/*.node` from source and runs. The hosted-only repository is not enough
+for either: it lacks the ordinary dependencies (`@oxc-project/types`,
+`node-gyp-build`, ...), so `npm i` fails with 404 before the platform question arises.
+
+If a package must refuse to install elsewhere, say so in the recipe - the renderer
+writes `os` and `cpu` into the published manifest:
+
+```yaml
+npm_publish:
+  - role: main
+    name: rolldown
+    dir: out/rolldown
+    os: linux
+    cpu: riscv64
+```
+
+npm then rejects those installs with `EBADPLATFORM` instead of falling back to upstream
+code, which is the honest signal when only our binary is meant to run.
+
 Pull requests only build and test; merging to `main` is the approval gate that also
 publishes. If publishing fails, the artifact is still there - the four build steps run
 before it.
