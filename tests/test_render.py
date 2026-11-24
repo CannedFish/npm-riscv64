@@ -962,6 +962,24 @@ class ManifestGenerationTests(unittest.TestCase):
                                        "@demo/widget-linux-x64"])
         self.assertEqual(deps["@demo/widget-linux-riscv64"], "1.0.0")
 
+    def test_the_merge_is_idempotent(self):
+        # The publish step rewrites the manifest of the tree it publishes from, so a
+        # second run sees its own entry. Refusing that turned a re-run into a failure
+        # ("did not grow") instead of a no-op.
+        self.write_manifest({
+            "name": "@demo/widget", "version": "1.0.0",
+            "optionalDependencies": {"@demo/widget-linux-x64": "1.0.0",
+                                     "@demo/widget-linux-riscv64": "1.0.0"},
+        })
+        spec = self.spec(manifest="upstream", optional={"@demo/widget-linux-riscv64": "1.0.0"})
+        first = self.prepare(spec)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertNotIn("added", first.stdout)
+        bytes_after_first = self.manifest()
+        second = self.prepare(spec)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.manifest(), bytes_after_first)
+
     def test_upstream_shape_touches_only_what_the_recipe_declares(self):
         self.write_manifest({"name": "@demo/widget", "version": "1.0.0", "main": "widget.js"})
         result = self.prepare(self.spec(manifest="upstream", main="widget.node",
@@ -1267,19 +1285,26 @@ class GeneratedScriptSyntaxTests(unittest.TestCase):
             self.assertTrue((out / "steps/manifest.mjs").is_file())
 
 class GoldenTests(unittest.TestCase):
-    """Snapshot the reference recipe so rendering drift is visible in review."""
+    """Snapshot the rendered actions so rendering drift is visible in review.
 
-    GOLDEN = REPO_ROOT / "tests/golden/bufferutil-4.2.0"
+    Two recipes are pinned on purpose: bufferutil is the single-package shape and
+    rolldown is the two-package shape, so the parts of the renderer that only differ
+    between them (publish ordering, manifest sources, template substitution) cannot
+    change unnoticed.
+    """
 
-    def _render(self, target: Path) -> None:
+    CASES = [("bufferutil", "4.2.0"), ("rolldown", "1.3.3")]
+    GOLDEN_ROOT = REPO_ROOT / "tests/golden"
+
+    def _render(self, pkg: str, ver: str, target: Path) -> None:
         result = subprocess.run(
             [
                 sys.executable,
                 "scripts/render.py",
                 "--pkg",
-                "bufferutil",
+                pkg,
                 "--ver",
-                "4.2.0",
+                ver,
                 "--out-dir",
                 str(target),
                 "--steps-dir",
@@ -1294,19 +1319,28 @@ class GoldenTests(unittest.TestCase):
     def test_render_matches_golden(self):
         import difflib
 
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "action"
-            self._render(target)
-            pairs = [(self.GOLDEN / "action.yml", target / "action.yml")]
-            # Every rendered step file, whatever its extension: the publish helper
-            # travels with the steps too, and drift in it should be visible as well.
-            pairs += [
-                (golden, target / "steps" / golden.name)
-                for golden in sorted((self.GOLDEN / "steps").iterdir())
-                if golden.is_file()
-            ]
-            for golden, actual in pairs:
-                with self.subTest(file=golden.name):
+        for pkg, ver in self.CASES:
+            golden_root = self.GOLDEN_ROOT / f"{pkg}-{ver}"
+            with self.subTest(recipe=f"{pkg}@{ver}"), tempfile.TemporaryDirectory() as tmp:
+                target = Path(tmp) / "action"
+                self._render(pkg, ver, target)
+
+                # The file *sets* have to match in both directions: a step file the
+                # renderer newly emits is exactly the kind of change a golden file
+                # comparison alone would miss.
+                expected_names = {p.name for p in (golden_root / "steps").iterdir() if p.is_file()}
+                actual_names = {p.name for p in (target / "steps").iterdir() if p.is_file()}
+                self.assertEqual(
+                    expected_names,
+                    actual_names,
+                    f"steps/ differs from {golden_root.name}/steps; regenerate with "
+                    "`python3 tests/regen_golden.py` and review the diff",
+                )
+
+                pairs = [(golden_root / "action.yml", target / "action.yml")]
+                pairs += [(golden_root / "steps" / name, target / "steps" / name)
+                          for name in sorted(expected_names)]
+                for golden, actual in pairs:
                     self.assertTrue(golden.is_file(), f"missing golden {golden}")
                     expected = golden.read_text(encoding="utf-8")
                     got = actual.read_text(encoding="utf-8")

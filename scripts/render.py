@@ -374,9 +374,9 @@ def _sibling(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _resolve_recipe_text(recipe_dir: Path, rel: str, entry: dict, spec: dict) -> str:
+def _resolve_recipe_text(recipe_dir: Path | str, rel: str, entry: dict, spec: dict) -> str:
     """Substitute the placeholders a template file (manifest/readme) may use."""
-    path = recipe_dir / rel
+    path = Path(recipe_dir) / rel
     if not path.is_file():
         raise RenderError(f"template not found: {path}")
     text = path.read_text(encoding="utf-8")
@@ -399,7 +399,7 @@ def _resolve_recipe_text(recipe_dir: Path, rel: str, entry: dict, spec: dict) ->
     return text
 
 
-def _publish_spec(entry: dict, entries: list[dict], recipe_dir: Path) -> dict:
+def _publish_spec(entry: dict, entries: list[dict], recipe_dir: Path | str) -> dict:
     """Resolve one npm_publish entry into the JSON the publish step consumes."""
     spec: dict = {
         "name": str(entry.get("name") or ""),
@@ -516,7 +516,10 @@ def generate_publish(
     entries = _publish_order(
         [e for e in (stat.get("npm_publish") or []) if isinstance(e, dict)]
     )
-    specs = [_publish_spec(entry, entries, recipe_dir) for entry in entries]
+    # Template files are read from the recipe itself (an absolute path): the render
+    # command runs from whatever directory a caller chose, and the recipe directory
+    # above is the repo-relative one that goes into the shell script.
+    specs = [_publish_spec(entry, entries, target.path) for entry in entries]
 
     auth_lines: list[str] = []
     seen_auth: set[tuple[str, str, str]] = set()

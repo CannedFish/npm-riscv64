@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -119,6 +120,17 @@ def main(argv: list[str] | None = None) -> int:
     if result.returncode != 0:
         print(result.stderr, file=sys.stderr)
         return result.returncode
+
+    # The action exports RECIPE_DIR as /w/<recipe dir> and the test step reads its
+    # skip list, vitest config and manifest templates from there (they travel with the
+    # recipe). In CI /w is the checkout, so the recipe exists at that path; the sandbox
+    # only holds the build tree, so the recipe is copied in.
+    recipe_src = (REPO_ROOT / args.root).joinpath(*args.pkg.split("/"), args.ver)
+    recipe_dst = workspace / "packages" / pathlib.Path(*args.pkg.split("/")) / args.ver
+    if recipe_dst.exists():
+        shutil.rmtree(recipe_dst)
+    recipe_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(recipe_src, recipe_dst)
 
     action_file = workspace / STEPS_DIR / "action.yml"
     action = yaml.safe_load(action_file.read_text(encoding="utf-8"))

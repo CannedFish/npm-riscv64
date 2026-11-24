@@ -137,20 +137,37 @@ if (mode === "--prepare") {
 
   const hasOptional = Object.keys(spec.optional || {}).length > 0;
   if (hasOptional) {
-    const before = Object.keys(pkg.optionalDependencies || {}).length;
-    pkg.optionalDependencies = { ...(pkg.optionalDependencies || {}) };
+    const upstreamDeps = { ...(pkg.optionalDependencies || {}) };
+    const upstreamNames = Object.keys(upstreamDeps);
+    pkg.optionalDependencies = { ...upstreamDeps };
+    let added = 0;
     for (const [depName, depVersion] of Object.entries(spec.optional)) {
+      const previous = pkg.optionalDependencies[depName];
+      if (previous === depVersion) continue;   // already merged by an earlier run
       pkg.optionalDependencies[depName] = depVersion;
       changes.push("optionalDependencies " + depName + "@" + depVersion);
+      if (previous === undefined) added += 1;
     }
-    // Adding a platform must never drop the platforms upstream already ships.
-    const after = Object.keys(pkg.optionalDependencies).length;
-    if (after <= before) {
-      fail(
-        "optionalDependencies did not grow (" + before + " before, " + after + " after); " +
-          "refusing to publish a package that may have lost upstream platforms"
-      );
+    // The merge is additive and idempotent: no platform upstream lists may disappear,
+    // and nothing but the packages this recipe publishes may appear. "Count must grow"
+    // would have refused the second run of a recipe that publishes out of the build
+    // tree, because the first run already wrote the entry into that manifest.
+    for (const name of upstreamNames) {
+      if (pkg.optionalDependencies[name] === undefined) {
+        fail("optionalDependencies lost " + name + ", a platform the base package ships");
+      }
     }
+    const extra = Object.keys(pkg.optionalDependencies).filter(
+      (name) => !upstreamNames.includes(name) && !(name in spec.optional)
+    );
+    if (extra.length) {
+      fail("optionalDependencies gained " + extra.join(", ") + ", which the recipe does not publish");
+    }
+    console.log(
+      added
+        ? "[publish] added " + added + " platform package(s) to optionalDependencies"
+        : "[publish] optionalDependencies already list " + Object.keys(spec.optional).join(", ")
+    );
   }
 
   // npm gives publishConfig.registry precedence over --registry, so a base package

@@ -11,7 +11,10 @@ Two package shapes exist (.dsh/plan.md D33):
 
 * ``prebuild`` - upstream's package plus one directory, ``prebuilds/linux-riscv64``;
 * ``wrapper`` - upstream's package where the only change is one more entry in
-  ``optionalDependencies`` (rolldown-style: the binary ships as its own package).
+  ``optionalDependencies`` (rolldown-style: the binary ships as its own package);
+* ``platform`` - a package that *is* upstream's platform package for another
+  architecture (``--base`` points at, say, the linux-x64 tarball): same files, same
+  manifest fields, only the arch-specific ones differ.
 
 Usage::
 
@@ -61,13 +64,56 @@ def elf_machine(data: bytes) -> int | None:
 
 
 def compare(ours: dict[str, bytes], base: dict[str, bytes], shape: str,
-            bindings: list[str]) -> tuple[list[str], list[str], list[str]]:
+            bindings: list[str], arch: dict[str, str | None] | None = None
+            ) -> tuple[list[str], list[str], list[str]]:
     """Return (added, removed, problems) for the shape the recipe publishes."""
+    arch = arch or {}
+    cpu, os_name, libc = arch.get("cpu"), arch.get("os"), arch.get("libc")
     added = sorted(set(ours) - set(base))
     removed = sorted(set(base) - set(ours))
     changed = sorted(p for p in (set(base) & set(ours)) if digest(base[p]) != digest(ours[p]))
     problems: list[str] = []
-    if shape == "prebuild":
+    if shape == "platform":
+        # Upstream's platform tarball for another CPU is the reference. The layout has
+        # to be the same once the architecture-specific binary name is normalized
+        # (<something>.node), and the manifest may differ only where the architecture
+        # differs.
+        def layout(paths: set[str]) -> set[str]:
+            return {p if not p.endswith(".node") else "<binary>.node" for p in paths}
+
+        if layout(set(ours)) != layout(set(base)):
+            problems.append(
+                "layout differs from the reference: "
+                f"{sorted(layout(set(ours)))} vs {sorted(layout(set(base)))}"
+            )
+        ours_manifest = json.loads(ours.get("package.json", b"{}"))
+        base_manifest = json.loads(base.get("package.json", b"{}"))
+        for field in ("description", "keywords", "homepage", "license", "engines",
+                      "repository", "bugs"):
+            if ours_manifest.get(field) != base_manifest.get(field):
+                problems.append(
+                    f"manifest field '{field}' differs from the reference: "
+                    f"{ours_manifest.get(field)!r} vs {base_manifest.get(field)!r}"
+                )
+        for field, wanted in (("cpu", cpu), ("os", os_name), ("libc", libc)):
+            if wanted is not None and ours_manifest.get(field) != [wanted]:
+                problems.append(f"manifest {field} is {ours_manifest.get(field)!r}, expected [{wanted!r}]")
+        # "files" names the binary itself, so it differs by construction: normalize the
+        # architecture-specific part before comparing.
+        def normalized_files(manifest: dict) -> list[str]:
+            return ["<binary>.node" if str(item).endswith(".node") else item
+                    for item in (manifest.get("files") or [])]
+
+        if normalized_files(ours_manifest) != normalized_files(base_manifest):
+            problems.append(
+                f"manifest files is {ours_manifest.get('files')!r}, "
+                f"the reference has {base_manifest.get('files')!r}"
+            )
+        if (ours_manifest.get("publishConfig") or {}).get("access") != "public":
+            problems.append("manifest publishConfig.access is not public (a scoped package needs it)")
+        if not str(ours_manifest.get("main", "")).endswith(".node"):
+            problems.append(f"manifest main is {ours_manifest.get('main')!r}, expected a .node file")
+    elif shape == "prebuild":
         if removed:
             problems.append(f"upstream files missing from the published package: {removed}")
         if changed not in ([], ["package.json"]):
@@ -104,8 +150,8 @@ def check_identity(ours: dict[str, bytes], name: str, version: str) -> list[str]
     return []
 
 
-def check_prebuild(ours: dict[str, bytes], name: str) -> list[str]:
-    path = f"prebuilds/linux-riscv64/{name}.node"
+def check_prebuild(ours: dict[str, bytes], name: str, path: str | None = None) -> list[str]:
+    path = path or f"prebuilds/linux-riscv64/{name}.node"
     node = ours.get(path, b"")
     machine = elf_machine(node)
     if machine is None:
@@ -122,7 +168,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("version", help="version as published")
     parser.add_argument("--registry", default=DEFAULT_REGISTRY)
     parser.add_argument("--base", default=None, help="upstream tarball URL (default: npmjs)")
-    parser.add_argument("--shape", choices=("prebuild", "wrapper"), default="prebuild")
+    parser.add_argument("--shape", choices=("prebuild", "wrapper", "platform"), default="prebuild")
+    parser.add_argument("--cpu", default=None, help="expected manifest cpu (platform shape)")
+    parser.add_argument("--os", default=None, help="expected manifest os (platform shape)")
+    parser.add_argument("--libc", default=None, help="expected manifest libc (platform shape)")
     parser.add_argument(
         "--bindings",
         action="append",
@@ -140,7 +189,9 @@ def main(argv: list[str] | None = None) -> int:
     ours = members(download(ours_url))
     base = members(download(base_url))
 
-    added, removed, problems = compare(ours, base, args.shape, bindings)
+    manifest = json.loads(ours.get("package.json", b"{}"))
+    arch = {"cpu": args.cpu, "os": args.os, "libc": args.libc}
+    added, removed, problems = compare(ours, base, args.shape, bindings, arch)
     problems += check_identity(ours, args.name, args.version)
 
     print(f"=== {args.name}@{args.version} ({args.shape})")
@@ -148,16 +199,24 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  added  : {added}")
     print(f"  changed: {[p for p in (set(base) & set(ours)) if digest(base[p]) != digest(ours[p])]}")
     print(f"  removed: {removed}")
-    if args.shape == "prebuild":
-        problems += check_prebuild(ours, args.name)
-
-    manifest = json.loads(ours.get("package.json", b"{}"))
     print(f"  manifest: name/version {manifest.get('name')}@{manifest.get('version')}, "
-          f"publishConfig {manifest.get('publishConfig')}")
+          f"main {manifest.get('main')}, cpu {manifest.get('cpu')}, "
+          f"os {manifest.get('os')}, libc {manifest.get('libc')}")
+    print(f"  publishConfig: {manifest.get('publishConfig')}")
+
     if args.shape == "prebuild":
         expected = [f"prebuilds/linux-riscv64/{args.name}.node"]
         if added != expected:
             problems.append(f"added files are {added}, expected exactly {expected}")
+        problems += check_prebuild(ours, args.name)
+    elif args.shape == "platform":
+        # A platform package keeps its binary at the root of the tarball, under the
+        # name its manifest.main names.
+        problems += check_prebuild(ours, args.name, str(manifest.get("main") or ""))
+        readme = ours.get("README.md", b"").decode("utf-8", "replace").strip()
+        if readme:
+            print(f"  README: {readme.splitlines()[-1]}")
+
     for problem in problems:
         print(f"  [FAIL] {problem}")
     if not problems:
