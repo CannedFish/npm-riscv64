@@ -156,10 +156,18 @@ setup_auth "https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-loca
 # through optionalDependencies.
 publish_pkg <<'PUBLISH_SPEC'
 {
+  "allow_overwrite": false,
+  "base": {
+    "integrity": "sha512-gyy58jET9kst2IGyBKb96a4Y2bPGTHXGyCd0/1eqIV3hr1Sz3VxtA8n7bXh8fLIuE2K6Z0Upax5a5Msx+HU1IQ==",
+    "url": "https://registry.npmjs.org/bufferutil/-/bufferutil-4.2.0.tgz"
+  },
   "dir": ".",
-  "kind": "source-tree",
-  "manifest": "generated",
+  "kind": "upstream-tarball",
+  "manifest": "upstream",
   "name": "bufferutil",
+  "overlay": [
+    "prebuilds/linux-riscv64"
+  ],
   "registry": "https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/",
   "version": "4.2.0"
 }

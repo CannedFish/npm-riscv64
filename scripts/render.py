@@ -31,6 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import check_patches  # noqa: E402
 import recipe_lib as rl  # noqa: E402
 
 PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z0-9_.\-]+)\s*\}\}")
@@ -831,11 +832,28 @@ def cmd_check_all(args: argparse.Namespace) -> int:
             for line in str(exc).splitlines():
                 print(f"       {line}")
             continue
+        problems = check_patches.check_target(
+            target, rl.load_stat(target), network=args.check_patches_network
+        )
+        for problem in problems:
+            failures += 1
+            print(f"[FAIL] {problem}")
         steps = rendered.count("\n    - name:")
         print(
             f"[ OK ] {target.ident}  (steps≈{steps}, scripts={','.join(sorted(scripts))}, "
             f"{len(rendered)} bytes)"
         )
+
+    # Upstream increments are documentation-grade, but a patch that cannot be
+    # submitted is worse than no patch: check them together with the recipes.
+    checked, increment_problems = check_patches.check_all(
+        root, network=args.check_patches_network
+    )
+    for problem in increment_problems:
+        failures += 1
+        print(f"[FAIL] {problem}")
+    if checked:
+        print(f"       ({checked} recipe(s) carry upstream increments)")
 
     print(f"\nchecked {len(targets)} recipe(s), {failures} failure(s)")
     return 1 if failures else 0
@@ -848,6 +866,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", default=DEFAULT_ROOT, help="recipes root (default: packages)")
     parser.add_argument(
         "--template", default=DEFAULT_TEMPLATE, help=f"action template (default: {DEFAULT_TEMPLATE})"
+    )
+    parser.add_argument(
+        "--check-patches-network",
+        action="store_true",
+        help="also clone the pinned upstream ref and run git apply --check on increments",
     )
     parser.add_argument("--out", help="output file for the rendered action")
     parser.add_argument(
