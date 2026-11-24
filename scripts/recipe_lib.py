@@ -25,7 +25,24 @@ REQUIRED_SNIPPETS = ("build", "test")
 COMMON_DIR = "common"
 STAT_FILE = ".stat"
 DISABLE_FILE = ".disable"
-ROLES = ("binary", "main")
+ROLES = ("binary", "main", "binding")
+#: Roles that publish a platform-specific package. ``binding`` is the upstream term
+#: (rolldown and other napi-rs projects); ``binary`` is the older spelling here.
+PLATFORM_ROLES = ("binary", "binding")
+
+#: Where a published package comes from. ``source-tree`` is the directory the build
+#: produced; ``upstream-tarball`` is the upstream npm package, pinned by integrity and
+#: extended with the recipe's riscv64 overlay (.dsh/plan.md D33).
+PUBLISH_KINDS = ("source-tree", "upstream-tarball")
+DEFAULT_PUBLISH_KIND = "source-tree"
+
+#: How the published manifest is obtained. ``generated`` writes name/version from the
+#: recipe; ``upstream`` publishes the package as it is (asserting name/version);
+#: ``template`` uses a recipe file (npm_publish[].manifest_template).
+MANIFEST_SHAPES = ("generated", "upstream", "template")
+
+#: Upstream increments (patches meant for an upstream PR) live here, never in patches/.
+UPSTREAM_INCREMENT_DIR = "upstream"
 
 #: How the recipe is built. A native recipe compiles inside a riscv64
 #: container (qemu); a cross recipe compiles on the host architecture with a
@@ -267,6 +284,82 @@ def validate_stat(target: Target, stat: dict) -> list[str]:
     else:
         problems.extend(_validate_publish_entries(target, publish))
 
+    problems.extend(_validate_upstream_increments(target, stat.get("upstream_increments")))
+
+    return problems
+
+
+def _validate_base(where: str, name: str, version: str, base) -> list[str]:
+    """A publish base must be the upstream tarball of exactly this name and version."""
+    problems: list[str] = []
+    if not isinstance(base, dict):
+        return [f"{where}.base must be a mapping with url and integrity"]
+    url = str(base.get("url") or "")
+    integrity = str(base.get("integrity") or "")
+    if not url:
+        problems.append(f"{where}.base.url is required")
+    else:
+        expected = f"{name}-{version}.tgz"
+        if not url.endswith(expected):
+            problems.append(
+                f"{where}.base.url must end with '{expected}': the base is the upstream "
+                "package for exactly this name and version, nothing else"
+            )
+        if not url.startswith(("https://", "http://")):
+            problems.append(f"{where}.base.url must be an http(s) URL")
+    if not integrity:
+        problems.append(
+            f"{where}.base.integrity is required: an unpinned base tarball makes the "
+            "published package unverifiable"
+        )
+    elif not integrity.startswith("sha512-"):
+        problems.append(
+            f"{where}.base.integrity must be npm's sha512 form ('sha512-<base64>')"
+        )
+    return problems
+
+
+def _validate_overlay(where: str, overlay: Iterable) -> list[str]:
+    """Overlay entries are copied into the base package, so they must stay relative."""
+    problems: list[str] = []
+    for item in overlay:
+        text = str(item)
+        if text.startswith("/") or ".." in Path(text).parts:
+            problems.append(
+                f"{where}.overlay entry '{text}' must stay inside the source tree"
+            )
+        if any(ch.isspace() for ch in text):
+            problems.append(f"{where}.overlay entry '{text}' must not contain whitespace")
+    return problems
+
+
+def _validate_upstream_increments(target: Target, increments) -> list[str]:
+    """Upstream increments are documentation-grade patches; they never build anything."""
+    problems: list[str] = []
+    if increments is None:
+        return problems
+    if not isinstance(increments, list) or not increments:
+        return ["upstream_increments must be a non-empty list when present"]
+    for index, item in enumerate(increments):
+        where = f"upstream_increments[{index}]"
+        if not isinstance(item, dict):
+            problems.append(f"{where} must be a mapping")
+            continue
+        patch = str(item.get("patch") or "")
+        if not patch:
+            problems.append(f"{where}.patch is required")
+        elif not patch.startswith(UPSTREAM_INCREMENT_DIR + "/"):
+            problems.append(
+                f"{where}.patch '{patch}' must live under '{UPSTREAM_INCREMENT_DIR}/': "
+                "build-time patches belong in patches/ because they change the build, "
+                "upstream increments do not"
+            )
+        elif not (target.path / patch).is_file():
+            problems.append(f"{where}.patch not found: {target.path / patch}")
+        if not isinstance(item.get("touches"), list) or not item.get("touches"):
+            problems.append(f"{where}.touches must list the upstream files the patch edits")
+        if not item.get("pr"):
+            problems.append(f"{where}.pr is required (the one line an upstream PR would say)")
     return problems
 
 
@@ -274,6 +367,7 @@ def _validate_publish_entries(target: Target, publish: Iterable) -> list[str]:
     problems: list[str] = []
     names: list[str] = []
     versions: dict[str, str] = {}
+    roles: dict[str, str] = {}
 
     for index, entry in enumerate(publish):
         where = f"npm_publish[{index}]"
@@ -292,6 +386,7 @@ def _validate_publish_entries(target: Target, publish: Iterable) -> list[str]:
         else:
             names.append(name)
             versions[name] = str(version or "")
+            roles[name] = str(role or "")
         if not version:
             problems.append(f"{where}.version is required")
         elif str(version) != target.ver:
@@ -301,8 +396,52 @@ def _validate_publish_entries(target: Target, publish: Iterable) -> list[str]:
             )
         if not entry.get("dir"):
             problems.append(f"{where}.dir is required (path inside the source tree)")
-        if role == "binary" and not (entry.get("os") and entry.get("cpu")):
-            problems.append(f"{where}: role=binary requires os and cpu")
+        if role in PLATFORM_ROLES and not (entry.get("os") and entry.get("cpu")):
+            problems.append(
+                f"{where}: role={role} requires os and cpu "
+                "(npm installs a platform package by those fields)"
+            )
+        kind = str(entry.get("kind") or DEFAULT_PUBLISH_KIND)
+        base = entry.get("base")
+        overlay = entry.get("overlay")
+        if kind not in PUBLISH_KINDS:
+            problems.append(f"{where}.kind '{kind}' is not supported; use one of {PUBLISH_KINDS}")
+        elif kind == "upstream-tarball":
+            problems.extend(_validate_base(where, str(name or ""), str(version or ""), base))
+            if not isinstance(overlay, list) or not overlay:
+                problems.append(
+                    f"{where}: kind=upstream-tarball needs a non-empty overlay "
+                    "(the riscv64 files added on top of the upstream package)"
+                )
+            else:
+                problems.extend(_validate_overlay(where, overlay))
+        elif base is not None or overlay is not None:
+            problems.append(
+                f"{where}: base/overlay only apply to kind=upstream-tarball"
+            )
+
+        shape = entry.get("manifest_shape")
+        if shape is not None and str(shape) not in MANIFEST_SHAPES:
+            problems.append(
+                f"{where}.manifest_shape '{shape}' is not supported; use one of {MANIFEST_SHAPES}"
+            )
+        elif str(shape or "") == "template":
+            template = entry.get("manifest_template")
+            if not template:
+                problems.append(f"{where}: manifest_shape=template needs manifest_template")
+            elif not (target.path / str(template)).is_file():
+                problems.append(f"{where}.manifest_template not found: {target.path / str(template)}")
+        if shape is not None and entry.get("generate_manifest") is not None:
+            problems.append(
+                f"{where}: set either manifest_shape or generate_manifest, not both "
+                "(manifest_shape is the newer spelling)"
+            )
+        readme = entry.get("readme")
+        if readme is not None and not (target.path / str(readme)).is_file():
+            problems.append(f"{where}.readme not found: {target.path / str(readme)}")
+        if entry.get("libc") is not None and not isinstance(entry.get("libc"), str):
+            problems.append(f"{where}.libc must be a single value (npm takes one libc per entry)")
+
         auth = entry.get("auth")
         if auth is not None and str(auth).strip().lower() not in PUBLISH_AUTH_KINDS:
             problems.append(
@@ -310,6 +449,38 @@ def _validate_publish_entries(target: Target, publish: Iterable) -> list[str]:
                 f"{PUBLISH_AUTH_KINDS} (omit the field for "
                 f"'{DEFAULT_PUBLISH_AUTH}')"
             )
+
+    for index, entry in enumerate(publish):
+        if not isinstance(entry, dict):
+            continue
+        deps = entry.get("optional_dependencies")
+        if deps is None:
+            continue
+        if not isinstance(deps, list) or not deps:
+            problems.append(f"npm_publish[{index}].optional_dependencies must be a non-empty list")
+            continue
+        if entry.get("role") != "main":
+            problems.append(
+                f"npm_publish[{index}].optional_dependencies belongs on the main package "
+                "(the package that references the platform ones)"
+            )
+        for dep in deps:
+            dep_name = str(dep)
+            if dep_name not in versions:
+                problems.append(
+                    f"npm_publish[{index}].optional_dependencies references unknown package "
+                    f"'{dep_name}'"
+                )
+            elif roles.get(dep_name) not in PLATFORM_ROLES:
+                problems.append(
+                    f"npm_publish[{index}].optional_dependencies '{dep_name}' is "
+                    f"role={roles.get(dep_name)}; it must be a platform package"
+                )
+            elif versions[dep_name] != str(entry.get("version") or ""):
+                problems.append(
+                    f"npm_publish[{index}] version {entry.get('version')} does not match "
+                    f"optional dependency {dep_name}@{versions[dep_name]}"
+                )
 
     for index, entry in enumerate(publish):
         if not isinstance(entry, dict):

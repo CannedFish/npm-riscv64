@@ -260,10 +260,9 @@ class BuildInputNarrowingTests(unittest.TestCase):
         self.repo = GitFixture(root)
         # The narrowing runs the *base* checkout's own tool, so the fixture carries the
         # real scripts and the real template; a stub would not render.
-        for name in ("recipe_lib.py", "render.py", "build_key.py"):
-            self.repo.write(
-                f"scripts/{name}", (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8")
-            )
+        for path in sorted((REPO_ROOT / "scripts").iterdir()):
+            if path.is_file() and path.suffix in {".py", ".sh", ".mjs"}:
+                self.repo.write(f"scripts/{path.name}", path.read_text(encoding="utf-8"))
         self.repo.write(TEMPLATE, (REPO_ROOT / TEMPLATE).read_text(encoding="utf-8"))
         self.repo.recipe("plain", "1.0.0")
         self.repo.recipe("@scope/demo", "2.0.0")

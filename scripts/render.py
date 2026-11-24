@@ -348,76 +348,128 @@ def generate_patch(patches: list[Path], recipe_dir: str) -> str:
     return "\n".join(lines)
 
 
-MANIFEST_JS = r"""const fs=require("node:fs");
-const path=require("node:path");
-const args=process.argv.slice(1);
-const dir=args[0], name=args[1], version=args[2], mode=args[3];
-const reqName=args[4]||"", reqVersion=args[5]||"", mainFile=args[6]||"";
-const osName=args[7]||"", cpuName=args[8]||"", registryUrl=args[9]||"";
-const file=path.join(dir, "package.json");
-const exists=fs.existsSync(file);
-if (mode === "verify") {
-  if (!exists) {
-    console.error("[publish] missing manifest: " + file);
-    process.exit(1);
-  }
-  const pkg=JSON.parse(fs.readFileSync(file, "utf8"));
-  if (pkg.name !== name) {
-    console.error("[publish] name mismatch: manifest has " + pkg.name + ", recipe wants " + name);
-    console.error("[publish] a rename would publish a different package; refusing");
-    process.exit(1);
-  }
-  if (String(pkg.version) !== String(version)) {
-    console.error("[publish] version mismatch: manifest has " + pkg.version + ", recipe wants " + version);
-    process.exit(1);
-  }
-  if (reqName && (pkg.optionalDependencies || {})[reqName] !== reqVersion) {
-    console.error("[publish] " + reqName + " must be pinned to " + reqVersion + " in optionalDependencies");
-    process.exit(1);
-  }
-  // A manifest that pins a different registry would publish outside the intent of
-  // the recipe, and --registry cannot override publishConfig (see generate mode).
-  // (No apostrophes here: this JavaScript is embedded in a single-quoted shell string.)
-  if (registryUrl && pkg.publishConfig && pkg.publishConfig.registry
-      && String(pkg.publishConfig.registry).replace(/\/+$/, "") !== registryUrl.replace(/\/+$/, "")) {
-    console.error("[publish] " + file + " pins publishConfig.registry=" + pkg.publishConfig.registry
-      + " but this recipe publishes to " + registryUrl);
-    console.error("[publish] npm prefers publishConfig over --registry; align the manifest or let the renderer generate it (generate_manifest: true)");
-    process.exit(1);
-  }
-  process.exit(0);
-}
-if (mode !== "generate" && mode !== "verify") {
-  console.error("[publish] unknown manifest mode: " + mode);
-  process.exit(1);
-}
-const pkg = exists ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
-pkg.name = name;
-pkg.version = version;
-if (mainFile && !pkg.main) { pkg.main = mainFile; }
-if (osName) { pkg.os = [osName]; }
-if (cpuName) { pkg.cpu = [cpuName]; }
-if (reqName) {
-  pkg.optionalDependencies = pkg.optionalDependencies || {};
-  pkg.optionalDependencies[reqName] = reqVersion;
-}
-// npm gives publishConfig.registry precedence over the --registry flag, so an
-// upstream manifest that pins its own registry would silently send the tarball
-// somewhere else. The registry from the recipe is the single source of truth (D13).
-if (registryUrl && pkg.publishConfig && pkg.publishConfig.registry
-    && String(pkg.publishConfig.registry).replace(/\/+$/, "") !== registryUrl.replace(/\/+$/, "")) {
-  console.log("[publish] publishConfig.registry " + pkg.publishConfig.registry
-    + " -> " + registryUrl + " (the recipe decides where this package goes)");
-  pkg.publishConfig.registry = registryUrl;
-}
-fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");
-console.log("[publish] wrote " + file + " (" + mode + ")");
-"""
+MANIFEST_HELPER = "manifest.mjs"
+PUBLISH_TEMPLATE_FILE = "publish_template.sh"
+
+
+def manifest_helper_source() -> str:
+    """The publish helper, read from its own file (see scripts/publish_manifest.mjs)."""
+    return _sibling(PUBLISH_TEMPLATE_FILE.replace("template.sh", "manifest.mjs"))
+
+
+def publish_template_source() -> str:
+    """The publish script template, read from its own file (scripts/publish_template.sh).
+
+    Keeping it as a real file means `bash -n` can check it in L0, and the renderer
+    never has to escape a multi-line shell script inside a Python literal.
+    """
+    return _sibling(PUBLISH_TEMPLATE_FILE)
+
+
+def _sibling(name: str) -> str:
+    path = Path(__file__).with_name(name)
+    if not path.is_file():
+        raise RenderError(f"missing {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def _resolve_recipe_text(recipe_dir: Path, rel: str, entry: dict, spec: dict) -> str:
+    """Substitute the placeholders a template file (manifest/readme) may use."""
+    path = recipe_dir / rel
+    if not path.is_file():
+        raise RenderError(f"template not found: {path}")
+    text = path.read_text(encoding="utf-8")
+    values = {
+        "name": str(spec.get("name") or ""),
+        "version": str(spec.get("version") or ""),
+        "registry": str(spec.get("registry") or ""),
+        "os": str(entry.get("os") or ""),
+        "cpu": str(entry.get("cpu") or ""),
+        "libc": str(entry.get("libc") or ""),
+        "main": str(entry.get("main") or ""),
+    }
+    for key, value in values.items():
+        text = text.replace("{{" + key + "}}", value)
+    leftover = sorted(set(PLACEHOLDER.findall(text)))
+    if leftover:
+        raise RenderError(
+            f"{path} has placeholders this renderer does not fill: {', '.join(leftover)}"
+        )
+    return text
+
+
+def _publish_spec(entry: dict, entries: list[dict], recipe_dir: Path) -> dict:
+    """Resolve one npm_publish entry into the JSON the publish step consumes."""
+    spec: dict = {
+        "name": str(entry.get("name") or ""),
+        "version": str(entry.get("version") or ""),
+        "registry": normalize_registry(
+            str(entry.get("registry") or "https://registry.npmjs.org")
+        ),
+        "dir": str(entry.get("dir") or "."),
+        "kind": str(entry.get("kind") or "source-tree"),
+    }
+    if entry.get("manifest_shape") is not None:
+        spec["manifest"] = str(entry.get("manifest_shape") or "generated")
+    else:
+        spec["manifest"] = "generated" if entry.get("generate_manifest") else "upstream"
+
+    for field in ("os", "cpu", "libc", "main"):
+        value = entry.get(field)
+        if value:
+            spec[field] = str(value)
+    engines = entry.get("engines")
+    if engines:
+        spec["engines"] = engines if isinstance(engines, dict) else {"node": str(engines)}
+
+    if spec["kind"] == "upstream-tarball":
+        base = entry.get("base") or {}
+        spec["base"] = {
+            "url": str(base.get("url") or ""),
+            "integrity": str(base.get("integrity") or ""),
+        }
+        spec["overlay"] = [str(item) for item in (entry.get("overlay") or [])]
+
+    optional: dict[str, str] = {}
+    for dep in entry.get("optional_dependencies") or []:
+        dep_name = str(dep)
+        for candidate in entries:
+            if str(candidate.get("name")) == dep_name:
+                optional[dep_name] = str(candidate.get("version") or "")
+                break
+    if optional:
+        spec["optional"] = optional
+
+    template = entry.get("manifest_template")
+    if template:
+        resolved = _resolve_recipe_text(recipe_dir, str(template), entry, spec)
+        try:
+            manifest = json.loads(resolved)
+        except json.JSONDecodeError as exc:
+            raise RenderError(f"manifest_template {template} is not valid JSON: {exc}")
+        if manifest.get("name") != spec["name"]:
+            raise RenderError(
+                f"manifest_template {template} names {manifest.get('name')}, "
+                f"the recipe publishes {spec['name']}"
+            )
+        if str(manifest.get("version")) != spec["version"]:
+            raise RenderError(
+                f"manifest_template {template} has version {manifest.get('version')}, "
+                f"the recipe publishes {spec['version']}"
+            )
+        spec["manifest"] = "template"
+        spec["manifest_json"] = manifest
+
+    readme = entry.get("readme")
+    if readme:
+        spec["readme_text"] = _resolve_recipe_text(recipe_dir, str(readme), entry, spec)
+    return spec
 
 
 def _publish_order(entries: list[dict]) -> list[dict]:
-    """Binary first, then topological order over ``requires``."""
+    """Platform packages first, then topological order over ``requires``."""
     by_name = {str(e.get("name")): e for e in entries if isinstance(e, dict)}
+    platform_roles = {"binary", "binding"}
 
     def deps(entry: dict) -> list[str]:
         return [str(d) for d in (entry.get("requires") or [])]
@@ -426,7 +478,7 @@ def _publish_order(entries: list[dict]) -> list[dict]:
     seen: set[str] = set()
     pending = sorted(
         [e for e in entries if isinstance(e, dict)],
-        key=lambda e: (0 if e.get("role") == "binary" else 1, str(e.get("name"))),
+        key=lambda e: (0 if e.get("role") in platform_roles else 1, str(e.get("name"))),
     )
 
     def visit(entry: dict) -> None:
@@ -444,107 +496,28 @@ def _publish_order(entries: list[dict]) -> list[dict]:
     return ordered
 
 
-def generate_publish(stat: dict, target: rl.Target, artifact_glob: str) -> str:
+def generate_publish(
+    stat: dict, target: rl.Target, artifact_glob: str, recipe_dir: Path
+) -> str:
+    """Generate the host-side publish step.
+
+    ``artifact_glob`` is unused here on purpose: the build stages what it produces
+    into the source tree, so publishing never moves binaries around.
+
+    Two kinds of publish source exist (see .dsh/plan.md D33):
+
+    * ``source-tree`` - the directory the build produced;
+    * ``upstream-tarball`` - the upstream npm package, pinned by sha512 and extended
+      with the recipe's overlay, so a published package keeps upstream's structure and
+      carries exactly one riscv64 increment.
+    """
     entries = _publish_order(
         [e for e in (stat.get("npm_publish") or []) if isinstance(e, dict)]
     )
-    lines: list[str] = [
-        "set -euo pipefail",
-        "",
-        "# Publishing runs on the host: moving files and talking to a registry does",
-        "# not need riscv64 emulation, and it keeps token handling straightforward.",
-        'REPO_ROOT="$(pwd)"',
-        'SRC_DIR="${SRC_DIR:-src}"',
-        'ARTIFACT_GLOB="'
-        + (('$SRC_DIR/' + artifact_glob) if artifact_glob else "")
-        + '"',
-        'export NPM_CONFIG_USERCONFIG="$REPO_ROOT/.npmrc.publish"',
-        ': > "$NPM_CONFIG_USERCONFIG"',
-        "",
-        'log() { echo "[publish] $*"; }',
-        "",
-        "setup_auth() {",
-        '  local registry="$1" token_env="$2" auth_kind="$3"',
-        '  [ -n "$token_env" ] || return 0',
-        '  if [ -z "${!token_env:-}" ]; then',
-        '    log "no credential in $token_env; talking to $registry unauthenticated"',
-        "    return 0",
-        "  fi",
-        "  # npm looks credentials up by the registry URL it talks to, path included:",
-        '  # "//host/repository/name/" is the key for a registry at .../repository/name/.',
-        '  local dart="${registry#*://}"',
-        '  dart="${dart%%\\?*}"',
-        '  dart="//$dart"',
-        '  [ "${dart: -1}" = "/" ] || dart="$dart/"',
-        '  if [ "$auth_kind" = "basic" ]; then',
-        "    # Basic credentials: base64 of user:password, as the registry asks for it",
-        "    # (WWW-Authenticate: Basic).",
-        "    printf '%s:_auth=${%s}\\n' \"$dart\" \"$token_env\" >> \"$NPM_CONFIG_USERCONFIG\"",
-        "  else",
-        "    printf '%s:_authToken=${%s}\\n' \"$dart\" \"$token_env\" >> \"$NPM_CONFIG_USERCONFIG\"",
-        "  fi",
-        '  log "auth configured for $dart via $token_env ($auth_kind)"',
-        "}",
-        "",
-        "publish_one() {",
-        '  local rel_dir="$1" name="$2" version="$3" registry="$4" mode="$5"',
-        '  local req_name="$6" req_version="$7" os_name="$8" cpu_name="$9"',
-        '  # dir is relative to the fetched source tree, never to the repository root.',
-        '  local dir="$SRC_DIR/$rel_dir"',
-        '  log "package $name@$version (dir=$dir, manifest=$mode)"',
-        '  local main_file=""',
-        '  if [ "$rel_dir" != "." ]; then',
-        '    mkdir -p "$dir"',
-        "    local f",
-        '    for f in $ARTIFACT_GLOB; do',
-        '      [ -e "$f" ] || continue',
-        '      cp -v "$f" "$dir/"',
-        '      main_file=$(basename "$f")',
-        "    done",
-        "  fi",
-        '  # Always publish an absolute path: npm reads a two-segment relative path',
-        '  # such as "src/." as a github shorthand spec, not as a directory.',
-        '  local abs_dir',
-        '  abs_dir=$(cd "$dir" && pwd) || { log "cannot enter $dir"; return 1; }',
-        "  node -e '" + MANIFEST_JS + "' \"$dir\" \"$name\" \"$version\" \"$mode\" "
-        '"$req_name" "$req_version" "$main_file" "$os_name" "$cpu_name" "$registry"',
-        "  # Publish, then read the registry answer, instead of trusting a lookup:",
-        "  # a registry that proxies or groups another one serves upstream versions of",
-        "  # the same name, so \"npm view <name>@<version>\" would report our own",
-        "  # package as already published and silently skip the whole point. Only the",
-        "  # target registry can say whether *this* version is present in it.",
-        "  # Stream npm's output instead of capturing it: on a slow route a 9 MB upload",
-        "  # can take minutes, and a captured command looks frozen in CI logs until it",
-        "  # finishes (which is exactly how a stuck publish reads). tee keeps the text for",
-        "  # the classification below while the log shows progress and request timings.",
-        '  local out_file status',
-        '  out_file="$(mktemp)"',
-        "  set +e",
-        '  npm publish "$abs_dir" --registry "$registry" --access public \\',
-        "    --ignore-scripts --no-audit --no-fund --loglevel http 2>&1 \\",
-        '    | tee "$out_file"',
-        "  status=${PIPESTATUS[0]}",
-        "  set -e",
-        "  if [ $status -eq 0 ]; then",
-        '    rm -f "$out_file"',
-        '    log "published $name@$version"',
-        "    return 0",
-        "  fi",
-        '  if grep -qE "EPUBLISHCONFLICT|409 Conflict|already exists|previously published|cannot publish over" "$out_file"; then',
-        '    rm -f "$out_file"',
-        '    log "already published: $name@$version (the registry refused a second publish; skipped)"',
-        "    return 0",
-        "  fi",
-        '  log "publish failed: $name@$version"',
-        '  printf \'%s\\n\' "$out_file" >&2',
-        '  log "registry answer is in $out_file"',
-        "  return 1",
-        "}",
-        "",
-        "# Credentials first: publishing may need auth before it can answer.",
-    ]
+    specs = [_publish_spec(entry, entries, recipe_dir) for entry in entries]
 
-    seen_auth: set[tuple[str, str]] = set()
+    auth_lines: list[str] = []
+    seen_auth: set[tuple[str, str, str]] = set()
     for entry in entries:
         registry = normalize_registry(
             str(entry.get("registry") or "https://registry.npmjs.org")
@@ -555,51 +528,18 @@ def generate_publish(stat: dict, target: rl.Target, artifact_glob: str) -> str:
         if key in seen_auth:
             continue
         seen_auth.add(key)
-        lines.append(f'setup_auth "{registry}" "{token_env}" "{auth_kind}"')
+        auth_lines.append(f'setup_auth "{registry}" "{token_env}" "{auth_kind}"')
 
-    lines.append("")
-    lines.append(
-        "# Publish order: native/binary packages first, then the JS package that"
-    )
-    lines.append("# references them through optionalDependencies.")
-    for entry in entries:
-        dir_value = str(entry.get("dir", "."))
-        name = str(entry.get("name", ""))
-        version = str(entry.get("version", ""))
-        registry = normalize_registry(
-            str(entry.get("registry") or "https://registry.npmjs.org")
-        )
-        mode = "generate" if entry.get("generate_manifest") else "verify"
-        requires = [str(d) for d in (entry.get("requires") or [])]
-        req_name = requires[0] if requires else ""
-        req_version = ""
-        if req_name:
-            for candidate in entries:
-                if str(candidate.get("name")) == req_name:
-                    req_version = str(candidate.get("version", ""))
-                    break
-        lines.append(
-            "publish_one "
-            + " ".join(
-                [
-                    f'"{dir_value}"',
-                    f'"{name}"',
-                    f'"{version}"',
-                    f'"{registry}"',
-                    f'"{mode}"',
-                    f'"{req_name}"',
-                    f'"{req_version}"',
-                    f'"{entry.get("os") or ""}"',
-                    f'"{entry.get("cpu") or ""}"',
-                ]
-            )
-        )
+    spec_blocks: list[str] = []
+    for spec in specs:
+        body = json.dumps(spec, indent=2, ensure_ascii=False, sort_keys=True)
+        spec_blocks.append("publish_pkg <<'PUBLISH_SPEC'\n" + body + "\nPUBLISH_SPEC")
 
-    lines.append("")
-    lines.append('log "publish finished for ' + str(target.ident) + '"')
-    return "\n".join(lines)
-
-
+    template = publish_template_source()
+    template = template.replace("@@AUTH@@", "\n".join(auth_lines))
+    template = template.replace("@@SPECS@@", "\n\n".join(spec_blocks))
+    template = template.replace("@@IDENT@@", str(target.ident))
+    return template
 # --------------------------------------------------------------------------
 # variables
 # --------------------------------------------------------------------------
@@ -688,7 +628,7 @@ def build_variables(
     if "patch" not in scripts and layers.patches:
         scripts["patch"] = generate_patch(layers.patches, recipe_dir)
     if "publish" not in scripts:
-        scripts["publish"] = generate_publish(stat, target, artifact_glob)
+        scripts["publish"] = generate_publish(stat, target, artifact_glob, recipe_dir)
 
     return variables, scripts
 
@@ -993,6 +933,12 @@ def main(argv: list[str] | None = None) -> int:
             script_path = steps_path / f"{name}.sh"
             script_path.write_text(content.rstrip("\n") + "\n", encoding="utf-8")
             script_path.chmod(0o755)
+        if "publish" in scripts:
+            # The publish step delegates manifest work to this helper; it travels with
+            # the steps so the workflow never has to pass a path in.
+            helper_path = steps_path / MANIFEST_HELPER
+            helper_path.write_text(manifest_helper_source(), encoding="utf-8")
+            helper_path.chmod(0o755)
         print(
             f"rendered {args.pkg}@{args.ver} -> {out_dir}"
             f" (action.yml + {len(scripts)} script(s))"
