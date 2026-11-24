@@ -71,6 +71,8 @@ test fails, read the diff - when the change is intended, refresh the snapshot wi
 | L0 | `python3 -m unittest discover -s tests` | renderer, layering, change detection, rendered YAML validity, golden snapshot of the reference recipe |
 | L1 | `python3 tests/run_action_locally.py --pkg bufferutil --ver 4.2.0` | the rendered action actually fetches, builds and tests under riscv64 emulation |
 | L2 | `python3 tests/l2_publish.py` | publish order A→B, idempotency, manifest merge, name identity, partial-failure re-entry (verdaccio) |
+| L2 | `python3 tests/verify_published.py bufferutil 4.2.0` | what the registry serves, compared file by file with upstream's own tarball (`--shape prebuild\|wrapper\|platform`) |
+| patches | `python3 scripts/check_patches.py [--network]` | `upstream/*.patch` are real, declared, repository-free diffs that still apply |
 | L3 | GitHub Actions in a fork | emulated qemu, artifact reuse, real registry publishing |
 
 L1 and L2 need docker. For L1, build the toolchain image once:
