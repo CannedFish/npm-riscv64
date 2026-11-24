@@ -259,7 +259,7 @@ installs and runs on other architectures - through upstream's own paths:
 
 | consumer | `rolldown` | `bufferutil` / `utf-8-validate` |
 | --- | --- | --- |
-| linux riscv64 | our binding (`dist/shared/rolldown-binding.linux-riscv64-gnu.node`) | our prebuild (`prebuilds/linux-riscv64/`) |
+| linux riscv64 | our platform package `@rolldown/binding-linux-riscv64-gnu`, installed through the wrapper's `optionalDependencies` | our prebuild (`prebuilds/linux-riscv64/`) |
 | linux x64 / arm64, macOS, Windows | upstream's optional binding package, resolved through the group repository's npmjs proxy | compiled from source by `node-gyp-build`, so a C/C++ toolchain is needed |
 
 No manifest restricts the platform (`os`/`cpu` are unset), so `npm install` on x64
@@ -290,11 +290,48 @@ Pull requests only build and test; merging to `main` is the approval gate that a
 publishes. If publishing fails, the artifact is still there - the four build steps run
 before it.
 
+## Upstream increments
+
+Every recipe that adds riscv64 support also carries the same increment written as a
+pull request for upstream, under `upstream/`. Those patches are **not applied here** -
+the recipes publish upstream's own artifacts plus our riscv64 addition - and they exist
+so the work can be offered back instead of living only in this repository. Anyone can
+read them and send them upstream as they are:
+
+| recipe | increment | upstream files |
+| --- | --- | --- |
+| `bufferutil` 4.2.0 | `build a linux-riscv64 prebuild and ship it in the release tarballs` | `.github/workflows/ci.yml` |
+| `utf-8-validate` 6.0.6 | same increment for its own CI | `.github/workflows/ci.yml` |
+| `rolldown` 1.3.3 | `build and publish a riscv64 binding` | `packages/rolldown/package.json`, `.github/workflows/reusable-release-build.yml` |
+
+`packages/<pkg>/<version>/upstream/*.patch` starts with a header naming the upstream
+repository, the base ref and the files it touches, then a real unified diff generated
+against a checkout of that ref. `scripts/check_patches.py` keeps them honest and runs
+as part of `--check-all`:
+
+* the patch is a genuine diff - no `/dev/null` sides, no invented headers, `a/` and
+  `b/` prefixes intact;
+* every file it changes is declared in `.stat: upstream_increments[].touches`, and
+  nothing else is;
+* it mentions nothing of this repository (registry hosts, mirrors, container files),
+  because a patch that does cannot be submitted;
+* the platform package name matches what napi-rs derives from the target triple
+  (`-riscv64-gnu` for `riscv64gc-unknown-linux-gnu`), and the increment actually adds
+  that target;
+* with `--check-patches-network`, `git apply --check` against the pinned upstream ref,
+  so a patch no longer applies is caught before someone opens the pull request.
+
+The distinction matters and is enforced rather than documented: `patches/` holds
+build-time patches this repository applies to make a build work, `upstream/` holds
+increments for upstream. The generated `patch` step never touches `upstream/`, and a
+test asserts that.
+
 ## Layout
 
 ```
-packages/<pkg>/<version>/   recipes (.stat, commands/, patches/); <pkg> is the npm
-                            name as published upstream (unscoped when upstream is)
+packages/<pkg>/<version>/   recipes (.stat, commands/, patches/, upstream/, templates/,
+                            tests/); <pkg> is the npm name as published upstream
+                            (unscoped when upstream is)
 docker/                     riscv64 toolchain image
 scripts/                    renderer, change detector, recipe helpers
 .github/templates/          the composite action template

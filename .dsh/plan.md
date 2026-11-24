@@ -915,3 +915,99 @@ rolldown 只需要交叉 gcc 做链接，不涉及该限制。
   tarball URL 改写回默认仓库 → tarball 404）。riscv64 容器内 `npm i rolldown` → `added 3 packages` →
   `bundle ok, arch=riscv64`。
 
+## 15. 2026-11-24 第三轮：上游形态发布（D30–D36）
+
+本轮的问题不是「哪个包没做」，而是**做出来的包不是上游那个包**：bufferutil / utf-8-validate
+发出去只剩 riscv64 一个平台目录（上游 6 个），rolldown 则把 19.5 MB 的 riscv64 二进制塞进
+主包，每台机器都白下。用户给的三条原则是：①不改上游打包习惯，只加 riscv64 增量；②测试走上游
+自己的套件，只补 riscv64 用例；③生成的 patch 必须是可直接提交上游的增量。以下决策照此落地。
+
+### D30 rolldown：发布形态跟随上游的双包
+
+* 上游每个 release 发**两个包**：纯 JS 的 `rolldown`，以及每目标一个的
+  `@rolldown/binding-<arch>-<abi>`（包内只有一个 `.node`）。因此本配方发两个包，绑定在前：
+  `@rolldown/binding-linux-riscv64-gnu@1.3.3`（3 文件）→ `rolldown@1.3.3`（上游 58 文件 + 一条
+  `optionalDependencies`）。
+* 绑定**不再** stage 进 wrapper 的 `dist/shared/`。旧做法依赖上游 `files` 里的 `!dist/*.node` 只匹配
+  `dist/` 直接子文件这个巧合，等于让每个架构都下载 riscv64 二进制；现在由 npm 按 `os`/`cpu` 决定是否安装。
+* 平台包清单用 `manifest_shape: template`（`templates/package.json`）而不是 `generated`：上游的
+  平台清单是 napi 在 release 时生成的，模板逐字段照抄（`files`/`engines`/`repository.directory`/`bugs`/
+  `publishConfig.access`/`os`/`cpu`/`libc`），riscv64 包与 x64 包只在架构相关字段上不同。
+* **测试 A 档**：上游 `packages/rolldown/tests/behaviors/emit-debug-data/*.test.js`（3 文件 6 例，
+  实测 **16.07s**，riscv64 容器内）。选它的理由是它只依赖公开 API 且是纯 JS；其余 `.test.ts` 需要
+  `@oxc-node/core`（riscv64 无二进制）与整仓库 devDeps，在 riscv64 上跑不起来。落地要点：包必须按
+  **真实依赖**加载（`server.deps.external`）而非走 runner 的 SSR 变换，否则 `import.meta.resolve`
+  被替换成 shim，上游那条并行插件用例会误报——而消费者装的正是真实依赖形态。
+
+### D31 prebuild 型包：上游 tarball 基座 + overlay
+
+* `base.kind: upstream-tarball`：publish 步骤下载上游 tarball、校验 `sha512`、解包，再把
+  `prebuilds/linux-riscv64` 拷进去。overlay **只增不改**（`allow_overwrite` 默认 false），所以上游
+  6 个平台目录逐字节保留。
+* 下载与校验放在 **publish 步骤内**（runner 上），不是 `fetch`：publish 侧不参与构建 key
+  （§13.11 的口径只看渲染后的 fetch/patch/build），配方换发布形态、改 integrity 都不会让缓存失效。
+* `manifest_shape: upstream`：清单用上游的，只写 `optionalDependencies`（本配方不发平台包时为空）
+  与 `publishConfig.registry`（npm 的 `publishConfig` 优先于 `--registry`，不改就会发到 npmjs）。
+* 上游仓库**不在 git 里存 `prebuilds/`**（是 CI 产物），所以「其余平台一个不少」只能在发布后的
+  tarball 上断言，不能在容器里断言——这条由 `tests/verify_published.py` 承担（D35）。
+
+### D32 清单生成：三形态 + 幂等合并
+
+* `manifest_shape`：`upstream`（原样保留，最像上游）/ `generated`（按 `.stat` 写平台字段）/
+  `template`（渲染 `templates/package.json`）。`manifest_shape` 与旧的 `generate_manifest` 互斥。
+* `optional_dependencies` 合并是**加性且幂等**：上游列出来的平台一个都不许消失，只许加本配方发布的
+  包，重跑必须产出同一份清单。原来的「数量必须变大」判定在 `source-tree` 发布下是错的——清单就写在
+  构建树里，第二次跑到这里会看到 17→17 而失败（本地 L2 重跑真实触发）。
+* `publishConfig.registry` 由渲染器改写；这是重发的包里**唯一**的清单差异，且在日志里显式记录。
+
+### D33 patch 分轨：`patches/` 与 `upstream/`
+
+* `patches/` = 构建期补丁（我们为了让构建能跑而加的），由生成的 `patch` 步骤应用。
+* `upstream/` = 同一个增量写成给上游的 PR，**本仓库从不应用**；`.stat` 的 `upstream_increments`
+  记 `patch`/`touches`/`pr`，其中 `touches` 必须等于 diff 触及的文件清单（双向相等）。
+* `scripts/check_patches.py` 是硬门禁，随 `--check-all` 跑：真 diff（无 `/dev/null` 两侧、`a/ b/` 前缀、
+  每文件一个 `diff --git`）；路径与 `touches` 双向相等；**不得出现本仓库任何痕迹**（仓库名、镜像、
+  容器文件、`render.py`、`dsh` 路径）；平台包名必须等于 napi 从 triplet 推出的名字
+  （`riscv64gc-unknown-linux-gnu` → `-riscv64-gnu`，注意 npm 的 `libc: glibc` 要映射成 `gnu`），且该增量
+  确实新增了这个 target；`--check-patches-network` 时对 pinned ref 跑 `git apply --check`。
+* 生成的 `patch` 步骤**永不**引用 `upstream/`，有单测断言——否则两条轨道迟早串味。
+
+### D34 测试数据跟着配方走
+
+* 配方可以带 `tests/`：`riscv64-skip.txt`（跳过的上游用例，一行一条，`#` 后写原因）、
+  `vitest.config.mjs`、`package.json`、模板文件的替代品等。
+* 模板把 `RECIPE_DIR=/w/<recipe.dir>` 传给 **test** 步骤：`/w` 在 CI 里就是 checkout，所以配方目录
+  可达；本地 `run_action_locally.py` 也把配方目录拷进 sandbox，保持同构（否则本地永远测不到这条路径）。
+* 测试**仍在 riscv64 容器里跑**（N1 不变）。bufferutil / utf-8-validate 的上游套件与架构无关，三个配方
+  目前都没有 skip 条目——机制在，空转。
+
+### D35 交付物核对进仓库
+
+* `tests/verify_published.py` 把「发布出来的字节」与「上游的字节」逐文件比对，三种形态：
+  `prebuild`（上游 + 一个 riscv64 目录，其余逐字节相同）、`wrapper`（文件集合等于上游、`optionalDependencies`
+  = 上游 + N）、`platform`（与上游另一个架构的平台包布局一致，清单逐字段相同、架构字段不同）。
+* 它是 opt-in 脚本（要一个真有该版本的仓库 + 能连 npmjs），不进单测；落地到 L2/L3 验收。
+
+### D36 上游增量必须公开
+
+* README 单列一节，把三个 `upstream/*.patch` 的内容、对应的上游仓库与文件、以及检查方式写清楚：
+  这些增量是准备提交给上游的，任何人不该需要读本仓库的实现细节才能把它交出去。
+
+### 本轮验证
+
+| 项 | 结果 |
+| --- | --- |
+| L0 | **136 用例通过**（`test_check_patches.py` 9 例、清单幂等 2 例、`GoldenTests` 改为两配方表驱动并加集合双向一致）；`--check-all` 3 配方 0 失败；`--check-patches` 0 问题（`--network` 亦 0） |
+| L1 bufferutil / utf-8-validate | 上游套件 8 / 10 例在 riscv64 通过 + riscv64 断言；产物 RISC-V ELF |
+| L1 rolldown | 上游 6 例通过（16.07s）；平台包 3 文件（9.1 MB packed / 19.5 MB unpacked）；主包 58 文件、无 `.node` |
+| L2 rolldown（verdaccio） | 两包 `PUT 201`；主包 58 文件 / 231.8 kB packed / 993 kB unpacked |
+| 产物核对 | bufferutil 13→14、utf-8-validate 16→17（新增仅 riscv64 prebuild，`e_machine=243`）；rolldown 主包 58=58（`optionalDependencies` 16→17）；平台包与 x64 平台包同构 |
+| 消费者（riscv64） | `npm i bufferutil` / `utf-8-validate` 解析到 `prebuilds/linux-riscv64`；`npm i rolldown` 装到 `@rolldown/binding-linux-riscv64-gnu` 并成功打包 JS |
+| 体积 | 主包 ~1 MB（与架构无关）、riscv64 平台包 9.1 MB packed / 19.5 MB unpacked；x64 消费者省下 19.5 MB |
+
+### 遗留风险
+
+* 目标仓库是否允许发布 `@rolldown` scope 未验证（本地误用 token 得到 403 是凭据问题，不足以判定）。
+  若拒绝：主包可改 `PUBLISH_SCOPE`，但平台包名不能改（loader 按字面量 `require`），必须由仓库放行该 scope。
+* rolldown 上游套件只跑 A 档三文件；扩大范围需要 `@oxc-node/core` 的 riscv64 构建，属上游议题。
+* `upstream-tarball` 基座在 publish 时依赖 npmjs 可达；断网重发会明确失败（宁可失败也不发来源不明的包）。
