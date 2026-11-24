@@ -90,8 +90,9 @@ publish_pkg() {
         log "overlay source missing: $SRC_DIR/$src_rel"
         return 1
       }
-      if [ -e "$work_dir/pkg/$dst_rel" ]; then
+      if [ -e "$work_dir/pkg/$dst_rel" ] && [ "$P_ALLOW_OVERWRITE" != "true" ]; then
         log "refusing to overwrite an upstream file with the overlay: $dst_rel"
+        log "the recipe can allow this with allow_overwrite: true"
         return 1
       fi
       mkdir -p "$(dirname "$work_dir/pkg/$dst_rel")"

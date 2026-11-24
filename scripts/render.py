@@ -407,7 +407,7 @@ def _publish_spec(entry: dict, entries: list[dict], recipe_dir: Path) -> dict:
             str(entry.get("registry") or "https://registry.npmjs.org")
         ),
         "dir": str(entry.get("dir") or "."),
-        "kind": str(entry.get("kind") or "source-tree"),
+        "kind": rl.publish_kind(entry),
     }
     if entry.get("manifest_shape") is not None:
         spec["manifest"] = str(entry.get("manifest_shape") or "generated")
@@ -429,6 +429,7 @@ def _publish_spec(entry: dict, entries: list[dict], recipe_dir: Path) -> dict:
             "integrity": str(base.get("integrity") or ""),
         }
         spec["overlay"] = [str(item) for item in (entry.get("overlay") or [])]
+        spec["allow_overwrite"] = bool(entry.get("allow_overwrite"))
 
     optional: dict[str, str] = {}
     for dep in entry.get("optional_dependencies") or []:

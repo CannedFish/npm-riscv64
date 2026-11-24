@@ -13,8 +13,8 @@
 //   --prepare <spec> <dir>                write <dir>/package.json (+ README.md)
 //
 // The spec mirrors one npm_publish entry after the renderer resolved it:
-//   { name, version, registry, dir, kind, manifest, base?, overlay?, optional?,
-//     os?, cpu?, libc?, main?, engines?, manifest_json?, readme_text? }
+//   { name, version, registry, dir, kind, manifest, base?, overlay?, allow_overwrite?,
+//     optional?, os?, cpu?, libc?, main?, engines?, manifest_json?, readme_text? }
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -65,6 +65,7 @@ if (mode === "--shell") {
     BASE_INTEGRITY: (spec.base || {}).integrity || "",
     // Space separated: overlay paths are validated to contain no whitespace.
     OVERLAY: (spec.overlay || []).join(" "),
+    ALLOW_OVERWRITE: spec.allow_overwrite ? "true" : "",
   };
   for (const [key, value] of Object.entries(scalars)) {
     console.log("P_" + key + "=" + shellQuote(value));

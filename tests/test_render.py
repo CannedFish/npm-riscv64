@@ -756,6 +756,32 @@ class PublishSourceTests(unittest.TestCase):
         }]))[0]
         self.assertEqual(spec["manifest"], "generated")
 
+    def test_base_kind_is_the_documented_spelling(self):
+        # The plan spells the kind inside base: (.dsh/plan.md D33); a top-level kind is
+        # the shorter form and must not disagree with it.
+        spec = self._specs(self._script([{
+            "role": "main", "name": "demo", "version": "1.0.0", "dir": ".",
+            "base": {
+                "kind": "upstream-tarball",
+                "url": "https://registry.npmjs.org/demo/-/demo-1.0.0.tgz",
+                "integrity": "sha512-abc",
+            },
+            "overlay": ["prebuilds/linux-riscv64"],
+        }]))[0]
+        self.assertEqual(spec["kind"], "upstream-tarball")
+        self.assertFalse(spec["allow_overwrite"])
+
+    def test_allow_overwrite_reaches_the_script(self):
+        script = self._script([{
+            "role": "main", "name": "demo", "version": "1.0.0", "dir": ".",
+            "base": {"kind": "upstream-tarball",
+                     "url": "https://registry.npmjs.org/demo/-/demo-1.0.0.tgz",
+                     "integrity": "sha512-abc"},
+            "overlay": ["prebuilds/linux-riscv64"],
+            "allow_overwrite": True,
+        }])
+        self.assertIn('"allow_overwrite": true', script)
+
     def test_upstream_tarball_carries_the_base_and_the_overlay(self):
         spec = self._specs(self._script([{
             "role": "main", "name": "demo", "version": "1.0.0", "dir": ".",

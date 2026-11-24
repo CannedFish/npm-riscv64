@@ -41,6 +41,18 @@ DEFAULT_PUBLISH_KIND = "source-tree"
 #: ``template`` uses a recipe file (npm_publish[].manifest_template).
 MANIFEST_SHAPES = ("generated", "upstream", "template")
 
+
+def publish_kind(entry: dict) -> str:
+    """How the package to publish is produced.
+
+    ``base.kind`` is the documented spelling (.dsh/plan.md D33); a top-level ``kind``
+    is accepted as the shorter form. ``source-tree`` keeps the older behaviour of
+    publishing the directory the build produced.
+    """
+    base = entry.get("base")
+    base_kind = base.get("kind") if isinstance(base, dict) else None
+    return str(entry.get("kind") or base_kind or DEFAULT_PUBLISH_KIND)
+
 #: Upstream increments (patches meant for an upstream PR) live here, never in patches/.
 UPSTREAM_INCREMENT_DIR = "upstream"
 
@@ -401,7 +413,7 @@ def _validate_publish_entries(target: Target, publish: Iterable) -> list[str]:
                 f"{where}: role={role} requires os and cpu "
                 "(npm installs a platform package by those fields)"
             )
-        kind = str(entry.get("kind") or DEFAULT_PUBLISH_KIND)
+        kind = publish_kind(entry)
         base = entry.get("base")
         overlay = entry.get("overlay")
         if kind not in PUBLISH_KINDS:
@@ -436,6 +448,14 @@ def _validate_publish_entries(target: Target, publish: Iterable) -> list[str]:
                 f"{where}: set either manifest_shape or generate_manifest, not both "
                 "(manifest_shape is the newer spelling)"
             )
+        allow_overwrite = entry.get("allow_overwrite")
+        if allow_overwrite is not None and not isinstance(allow_overwrite, bool):
+            problems.append(
+                f"{where}.allow_overwrite must be a boolean (true lets the overlay replace "
+                "upstream files, which has to be a deliberate decision)"
+            )
+        if allow_overwrite is not None and publish_kind(entry) != "upstream-tarball":
+            problems.append(f"{where}.allow_overwrite only applies to kind=upstream-tarball")
         readme = entry.get("readme")
         if readme is not None and not (target.path / str(readme)).is_file():
             problems.append(f"{where}.readme not found: {target.path / str(readme)}")
