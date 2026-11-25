@@ -263,11 +263,11 @@ recorded in the log.
    `--force` the registry decides, which is the only party that can.
 3. **the step is green only if the registry serves these exact bytes.** After the
    upload (accepted or refused) the step recomputes the digest of what npm would
-   upload (`npm pack --dry-run --json`) and reads the version's `dist.integrity` from
-   the registry (`npm view <name>@<version> --json`, which uses `preferOnline` so it
-   cannot answer from a pre-publish cache). Equal and the version references the
-   recipe's platform packages ⇒ "already published: identical artifact, nothing to
-   do". Not equal ⇒ hard failure naming both digests.
+   upload (`npm pack --dry-run --json`) and asks the registry what it serves
+   (`npm view <name>@<version> --json`, which uses `preferOnline` so it cannot answer
+   from a pre-publish cache). A match, plus a version that references the recipe's
+   platform packages, is "already published: identical artifact, nothing to do" -
+   the truth of a re-run. A different digest is a hard failure naming both.
    This is the check that was missing: a refusal used to be logged as
    "already published" and the step stayed green while the mirror went on serving
    upstream's `rolldown@1.3.3` without `@rolldown/binding-linux-riscv64-gnu` -
@@ -276,6 +276,34 @@ recorded in the log.
    that proxies or groups another one serves upstream versions of the same name, so
    such a lookup reports our own package as published and the publish silently never
    happens (witnessed with verdaccio and `bufferutil@4.2.0`).
+
+   What "serves these bytes" is established *from* matters, because registries
+   answer in three different ways, and the check has to read all three:
+
+   | what the served document carries | how the check answers |
+   | --- | --- |
+   | `dist.integrity` (npmjs, verdaccio, GitHub Packages) | compare the sha512 |
+   | only `dist.shasum` (older hosted repositories) | compare the sha1 |
+   | only `dist.tarball` (the private registry this repository rehearses against) | download it and compare the bytes |
+
+   Two implementation notes, both paid for by a red run:
+
+   * `npm view --json` prints an **object** up to npm 11 and a one-element **list**
+     from npm 12. Reading the list as a manifest leaves every `dist` lookup empty,
+     which once reported a delivered package as "the registry serves something else"
+     - absence of a field must never be read as a mismatch.
+   * the tarball download authenticates the way npm does: the credential is looked
+     up in the generated `.npmrc` by longest matching nerf-dart (scheme dropped, last
+     path segment dropped), because a registry that publishes no digest still
+     requires auth to read the tarball.
+
+   An unverifiable answer is its own state, not a verdict: after an accepted upload
+   it is a **warning** (the package is there; the registry simply publishes no digest
+   and/or the tarball cannot be read), while after a refusal it is a **failure**
+   (nothing at all shows our bytes are what a consumer would get), which is the case
+   the check exists for. `PUBLISH_VERIFY=digest` skips the download for a route too
+   slow to read packages back (the answer then says so instead of pretending),
+   and `PUBLISH_VERIFY_MAX_BYTES` (default 64 MB) caps what it will download.
 4. credentials: `token_env` names an environment variable; when it is set, a line
    keyed by the **full registry URL** (path included, npm looks credentials up by the
    URL it talks to) is written to a throwaway `.npmrc`. The registry URL is
@@ -508,7 +536,7 @@ python3 tests/run_action_locally.py --pkg bufferutil --ver 4.2.0 \
 | --- | --- | --- |
 | L0 | `python3 -m unittest discover -s tests` | renderer, layering, detection, generated YAML validity, golden snapshot (`tests/golden/`, refresh with `python3 tests/regen_golden.py`) |
 | L1 | `python3 tests/run_action_locally.py --pkg bufferutil --ver 4.2.0` | the rendered action really fetches, builds and tests under riscv64 emulation |
-| L2 | `python3 tests/l2_publish.py` | publish order, idempotency, manifest merge, identity, partial-failure re-entry against verdaccio |
+| L2 | `python3 tests/l2_publish.py` | publish order, idempotency, manifest merge, identity, partial-failure re-entry against verdaccio (`DSH_L2_PORT=4874` when a leftover container holds the default port); the first publish is a real 201, so this also rehearses the served-bytes assertion |
 | L2 (delivered) | `python3 tests/verify_published.py <pkg> <ver> [--shape …]` | the bytes a registry serves compared with upstream's: file by file, manifest field by field |
 | patches | `python3 scripts/check_patches.py [--network]` | `upstream/*.patch` are real diffs, declared, free of this repository's traces, and still apply |
 

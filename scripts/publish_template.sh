@@ -140,8 +140,9 @@ publish_pkg() {
     tee "$out_file"
   status=${PIPESTATUS[0]}
   set -e
-  local refused=""
+  local refused="" accepted=""
   if [ $status -eq 0 ]; then
+    accepted="yes"
     log "published $P_NAME@$P_VERSION"
   elif grep -qE "EPUBLISHCONFLICT|409 Conflict|already exists|previously published|cannot publish over" "$out_file"; then
     refused="yes"
@@ -159,7 +160,16 @@ publish_pkg() {
   # already holds someone else's artifact stops the step here instead of passing as
   # "already published" - that is how a green build once left the mirror serving
   # upstream's package without the riscv64 increment.
-  node "$STEPS_DIR/manifest.mjs" --assert-served "$spec_json" "$abs_dir" || return 1
+  #
+  # `--accepted` matters when the registry publishes no digest at all: after a 201 the
+  # absence of evidence is a warning (the artifact is there, just not checkable), while
+  # after a refusal it is a failure (nothing at all shows our bytes are what a
+  # consumer gets).
+  if [ -n "$accepted" ]; then
+    node "$STEPS_DIR/manifest.mjs" --assert-served "$spec_json" "$abs_dir" --accepted || return 1
+  else
+    node "$STEPS_DIR/manifest.mjs" --assert-served "$spec_json" "$abs_dir" || return 1
+  fi
   if [ -n "$refused" ]; then
     log "already published: $P_NAME@$P_VERSION (identical artifact, nothing to do)"
   fi

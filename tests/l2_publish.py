@@ -13,8 +13,9 @@ equivalent):
    rejected instead of silently published under another name.
 5. Partial-failure re-entry - if B fails, a rerun publishes only B.
 
-The registry is verdaccio, started on 127.0.0.1:4873 with uplinks disabled so the
-test is hermetic.
+The registry is verdaccio, started on 127.0.0.1:4873 (``DSH_L2_PORT`` picks another
+port, which matters when a leftover container still holds the default) with uplinks
+disabled so the test is hermetic.
 
 Usage::
 
@@ -36,7 +37,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SANDBOX = REPO_ROOT / ".dsh/tmp/l2"
-REGISTRY = "http://127.0.0.1:4873"
+PORT = int(os.environ.get("DSH_L2_PORT", "4873"))
+REGISTRY = f"http://127.0.0.1:{PORT}"
 USER = "dsh"
 PASSWORD = "dsh-test-password"
 EMAIL = "dsh@example.com"
@@ -72,6 +74,9 @@ npm_publish:
     version: {ver}
     dir: .
     requires: ["@demo/{name}-linux-riscv64-gnu"]
+    # The platform reference is declared rather than inferred from `requires`:
+    # requires is build ordering, optional_dependencies is what an install pulls.
+    optional_dependencies: ["@demo/{name}-linux-riscv64-gnu"]
     token_env: NODE_AUTH_TOKEN
     generate_manifest: {main_manifest}
   - role: binary
@@ -173,7 +178,7 @@ def start_registry(work: Path) -> None:
             "--name",
             CONTAINER,
             "-p",
-            "127.0.0.1:4873:4873",
+            f"127.0.0.1:{PORT}:4873",
             "-v",
             f"{conf_dir}:/verdaccio/conf",
             "-v",
@@ -213,10 +218,14 @@ def make_recipe(root: Path, ver: str, *, main_manifest: str = "true") -> Path:
     recipe = root / "packages/@demo/widget" / ver
     (recipe / "commands").mkdir(parents=True, exist_ok=True)
     # Mirror the CI layout: the recipe lives in packages/, the built source tree
-    # (and the manifest that gets published) lives in src/.
+    # (and the manifest that gets published) lives in src/. The binary package's
+    # directory is normally created by the build step, which this harness does not
+    # run, so it is created here with something to publish.
     src = root / "src"
     (src / "prebuilds/linux-riscv64").mkdir(parents=True, exist_ok=True)
     (src / "prebuilds/linux-riscv64/widget.node").write_bytes(b"\x7fELF not really")
+    (src / "build/pkg").mkdir(parents=True, exist_ok=True)
+    (src / "build/pkg/widget.node").write_bytes(b"\x7fELF not really")
     (recipe / ".stat").write_text(
         STAT.format(ver=ver, name="widget", main_manifest=main_manifest),
         encoding="utf-8",
@@ -270,7 +279,7 @@ def npm_view(name: str, version: str, token: str, workspace: Path) -> dict | Non
     env.update(HOME=str(workspace / "home"), npm_config_cache=str(workspace / "npm-cache"))
     npmrc = workspace / ".view-npmrc"
     npmrc.write_text(
-        f"//127.0.0.1:4873/:_authToken={token}\n", encoding="utf-8"
+        f"//127.0.0.1:{PORT}/:_authToken={token}\n", encoding="utf-8"
     )
     env["NPM_CONFIG_USERCONFIG"] = str(npmrc)
     result = subprocess.run(
@@ -403,10 +412,13 @@ def main(argv: list[str] | None = None) -> int:
         result4 = run_publish(script4, recipe_root, token)
         print(result4.stderr.strip())
         failures.check(result4.returncode != 0, "rename is rejected")
+        # The refusal has to name both sides, not just say "no".
+        combined = result4.stdout + result4.stderr
         failures.check(
-            "name mismatch" in result4.stderr or "name mismatch" in result4.stdout,
+            "the base package is other-name" in combined
+            and "the recipe publishes @demo/widget" in combined,
             "the rejection names the mismatch",
-            result4.stdout + result4.stderr,
+            combined,
         )
 
         # ---- case 5: partial failure re-entry -------------------------------

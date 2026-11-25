@@ -399,12 +399,20 @@ before it.
 Publishing is not "did the upload return 200". A mirror that proxies npmjs already
 carries upstream's copy of the version being republished, so the step publishes with
 `--force` (letting the registry decide instead of npm's client-side refusal), then reads
-back what the registry serves for that version and compares its `dist.integrity` with
-the digest of the tarball it just built, and checks that the served manifest still
-references the platform package. Green therefore means *the registry serves our bytes*;
-a version holding someone else's artifact fails loudly instead of passing as "already
-published" - which is exactly how a fork run once stayed green while the mirror kept
-serving `rolldown@1.3.3` without the riscv64 binding.
+back what the registry serves for that version and compares it with the digest of the
+tarball it just built, and checks that the served manifest still references the platform
+package. Green therefore means *the registry serves our bytes*; a version holding
+someone else's artifact fails loudly instead of passing as "already published" - which is
+exactly how a fork run once stayed green while the mirror kept serving `rolldown@1.3.3`
+without the riscv64 binding.
+
+Registries answer in three shapes, and the check reads all of them: a `dist.integrity`
+(npmjs, verdaccio, GitHub Packages), only a `dist.shasum` (older hosted repositories),
+or neither and just a `dist.tarball` - then the step downloads the tarball and compares
+the bytes. The last shape costs a download of what was just uploaded, which on a slow
+route is worth knowing: `PUBLISH_VERIFY=digest` skips it (the log then says the artifact
+was accepted but not verified instead of claiming a check it did not do), and
+`PUBLISH_VERIFY_MAX_BYTES` (64 MB by default) refuses anything above that size.
 
 ## Upstream increments
 
