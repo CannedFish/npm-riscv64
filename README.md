@@ -292,6 +292,16 @@ Pull requests only build and test; merging to `main` is the approval gate that a
 publishes. If publishing fails, the artifact is still there - the four build steps run
 before it.
 
+Publishing is not "did the upload return 200". A mirror that proxies npmjs already
+carries upstream's copy of the version being republished, so the step publishes with
+`--force` (letting the registry decide instead of npm's client-side refusal), then reads
+back what the registry serves for that version and compares its `dist.integrity` with
+the digest of the tarball it just built, and checks that the served manifest still
+references the platform package. Green therefore means *the registry serves our bytes*;
+a version holding someone else's artifact fails loudly instead of passing as "already
+published" - which is exactly how a fork run once stayed green while the mirror kept
+serving `rolldown@1.3.3` without the riscv64 binding.
+
 ## Upstream increments
 
 Every recipe that adds riscv64 support also carries the same increment written as a

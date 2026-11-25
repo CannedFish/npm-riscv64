@@ -249,20 +249,34 @@ npmjs.org would send the tarball somewhere the recipe never asked for. With
 `upstream` the realignment is the only edit a republished package carries, and it is
 recorded in the log.
 
-### 6.3 Visibility, idempotency and credentials
+### 6.3 Visibility, replacement and what green means
 
 1. visibility: the publish runs with `--loglevel http` and its output is streamed
    (`| tee`) instead of captured, because a captured npm looks frozen in CI logs
    until it exits - a slow upload then reads as "publish hangs" with no evidence.
    The streamed text is still classified in (2).
-2. idempotency: `npm publish` runs, and the registry answer decides. A "this version
-   already exists" refusal (409 / `EPUBLISHCONFLICT` / "cannot publish over") is
-   logged as a skip so a rerun stays green; anything else fails. A plain
-   `npm view <name>@<version>` lookup is deliberately not used: a registry that
-   proxies or groups another one serves upstream versions of the same name, so the
-   lookup reports our own package as published and the publish silently never
+2. `npm publish` runs with `--force`. npm >= 11 refuses client-side, before sending
+   anything, to publish a version the registry already knows ("You cannot publish
+   over the previously published versions"); a mirror carrying upstream's release
+   always answers that way, and refusing to replace is the wrong rule here, because
+   the tarball being published *is* that release plus the riscv64 increment. With
+   `--force` the registry decides, which is the only party that can.
+3. **the step is green only if the registry serves these exact bytes.** After the
+   upload (accepted or refused) the step recomputes the digest of what npm would
+   upload (`npm pack --dry-run --json`) and reads the version's `dist.integrity` from
+   the registry (`npm view <name>@<version> --json`, which uses `preferOnline` so it
+   cannot answer from a pre-publish cache). Equal and the version references the
+   recipe's platform packages ⇒ "already published: identical artifact, nothing to
+   do". Not equal ⇒ hard failure naming both digests.
+   This is the check that was missing: a refusal used to be logged as
+   "already published" and the step stayed green while the mirror went on serving
+   upstream's `rolldown@1.3.3` without `@rolldown/binding-linux-riscv64-gnu` -
+   a green build that delivered no riscv64 support (witnessed in the fork's L3 run).
+   A registry lookup is still never used to *decide whether to publish*: a registry
+   that proxies or groups another one serves upstream versions of the same name, so
+   such a lookup reports our own package as published and the publish silently never
    happens (witnessed with verdaccio and `bufferutil@4.2.0`).
-3. credentials: `token_env` names an environment variable; when it is set, a line
+4. credentials: `token_env` names an environment variable; when it is set, a line
    keyed by the **full registry URL** (path included, npm looks credentials up by the
    URL it talks to) is written to a throwaway `.npmrc`. The registry URL is
    normalized to end with `/` first: npm computes the credential key with
@@ -272,7 +286,7 @@ recorded in the log.
    `//<host>/<path>/:_authToken=${TOKEN_ENV}` for `auth: token` (the default), or
    `//<host>/<path>/:_auth=${TOKEN_ENV}` for `auth: basic`, which is what a registry
    answering `WWW-Authenticate: Basic` expects (the value is base64 `user:password`).
-4. `npm publish <absolute dir> --registry <registry> --access public --ignore-scripts`.
+5. `npm publish <absolute dir> --registry <registry> --access public --force --ignore-scripts`.
 
 `name` is identity: publishing a package whose manifest is named differently is refused
 rather than published under a second name - a rename ships "another package", not an

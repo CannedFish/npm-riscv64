@@ -11,10 +11,12 @@
 //   --shell <spec>                        P_* shell assignments for the caller
 //   --verify-integrity <spec> <tarball>   compare sha512 with base.integrity
 //   --prepare <spec> <dir>                write <dir>/package.json (+ README.md)
+//   --assert-served <spec> <dir>          fail unless the registry serves exactly these bytes
 //
 // The spec mirrors one npm_publish entry after the renderer resolved it:
 //   { name, version, registry, dir, kind, manifest, base?, overlay?, allow_overwrite?,
 //     optional?, os?, cpu?, libc?, main?, engines?, manifest_json?, readme_text? }
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -48,9 +50,11 @@ function sameRegistry(left, right) {
   return trim(left) === trim(right);
 }
 
-const spec = mode === "--shell" || mode === "--verify-integrity" || mode === "--prepare"
-  ? readSpec(argv[1])
-  : fail("unknown mode: " + mode);
+const spec =
+  mode === "--shell" || mode === "--verify-integrity" || mode === "--prepare" ||
+  mode === "--assert-served"
+    ? readSpec(argv[1])
+    : fail("unknown mode: " + mode);
 
 if (mode === "--shell") {
   // Only what the shell itself needs; the manifest work stays here.
@@ -198,5 +202,107 @@ if (mode === "--prepare") {
   console.log(
     "[publish] " + file + " (" + manifestMode + ") " +
       (changes.length ? "changed: " + changes.join("; ") : "unchanged")
+  );
+}
+
+// npm itself is used here, not a registry client: the tarball npm would upload and the
+// credential the step configured are both npm's, so a second implementation could
+// disagree with them and report a false conflict.
+function runNpm(args, cwd) {
+  // npm runs as a node script when npm_execpath is set (the usual case inside a step).
+  const command = process.env.npm_execpath
+    ? [process.execPath, process.env.npm_execpath]
+    : ["npm"];
+  const [cmd, ...prefix] = command;
+  const result = spawnSync(cmd, [...prefix, ...args], {
+    cwd,
+    encoding: "utf8",
+    env: process.env,
+  });
+  return { status: result.status, stdout: result.stdout || "", stderr: result.stderr || "" };
+}
+
+// dry-run packs without writing the tarball, and reports the digest of the bytes npm
+// would upload: the same code path `npm publish` uses for the directory.
+function packedIntegrity(dir) {
+  const result = runNpm(
+    ["pack", "--dry-run", "--json", "--ignore-scripts", dir],
+    dir,
+  );
+  if (result.status !== 0) {
+    return { error: result.stderr.trim() || "npm pack failed" };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(result.stdout);
+  } catch (error) {
+    return { error: "cannot read npm pack output: " + error.message };
+  }
+  // npm <=10 prints an array, npm >=11 an object keyed by package name.
+  const entry = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0];
+  if (!entry || !entry.integrity) {
+    return { error: "npm pack reported no integrity" };
+  }
+  return { integrity: entry.integrity, files: entry.files || [] };
+}
+
+function servedManifest() {
+  const result = runNpm(
+    ["view", spec.name + "@" + spec.version, "--json", "--registry", spec.registry],
+    null,
+  );
+  if (result.status !== 0) {
+    return { error: result.stderr.trim() || "npm view failed" };
+  }
+  try {
+    return { manifest: JSON.parse(result.stdout) };
+  } catch (error) {
+    return { error: "cannot read npm view output: " + error.message };
+  }
+}
+
+if (mode === "--assert-served") {
+  // A published package is a claim about what consumers install. The registry answer
+  // to `npm publish` says the upload was accepted; this says the registry now serves
+  // *these* bytes. They are not the same statement: a repository that proxies npmjs
+  // already serves upstream's copy of the version being republished, so a refused
+  // publish used to be logged as "already published" while the mirror kept serving
+  // upstream's package - green step, wrong package, riscv64 support missing.
+  const dir = argv[2];
+  const ours = packedIntegrity(dir);
+  if (ours.error) fail("cannot compute what this publish would upload: " + ours.error);
+  const theirs = servedManifest();
+  if (theirs.error) {
+    fail(
+      "cannot read what " + spec.name + "@" + spec.version + " serves at " +
+        spec.registry + ": " + theirs.error
+    );
+  }
+  const served = theirs.manifest || {};
+  const servedIntegrity = (served.dist || {}).integrity || "";
+  if (servedIntegrity !== ours.integrity) {
+    fail(
+      "the registry does not serve this artifact:\n" +
+        "  this publish:  " + ours.integrity + "\n" +
+        "  it serves:     " + (servedIntegrity || "(no integrity)") + "\n" +
+        "that version holds something else - upstream's copy, or an earlier publish of " +
+        "ours - and the registry does not let a publish replace it. Nothing was " +
+        "delivered: enable redeploy (or delete that version) on the registry, or give " +
+        "the recipe a version it can own."
+    );
+  }
+  const expected = spec.optional || {};
+  for (const [depName, depVersion] of Object.entries(expected)) {
+    const actual = (served.optionalDependencies || {})[depName];
+    if (actual !== depVersion) {
+      fail(
+        "the served manifest does not reference " + depName + "@" + depVersion +
+          " (" + (actual ? "it lists " + actual : "it has no such entry") + "); " +
+          "installing this package would not pull the riscv64 build"
+      );
+    }
+  }
+  console.log(
+    "[publish] the registry serves this artifact (" + ours.integrity.slice(0, 19) + "...)"
   );
 }
