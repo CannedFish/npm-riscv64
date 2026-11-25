@@ -10,6 +10,15 @@ on:
     types: [opened, synchronize, reopened]
   push:
     branches: [main]
+  # Manual lever: publish the cached trees again without building anything. Needed
+  # when the delivery side changed and the recipes did not - or when a registry
+  # rejected what an earlier run pushed.
+  workflow_dispatch:
+    inputs:
+      republish:
+        description: "Publish every recipe from the cached build tree (no rebuild)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -26,7 +35,9 @@ concurrency:
 jobs:
   detect:
     name: detect changed recipes
-    runs-on: ubuntu-latest
+    # Self-hosted runners are addressed by one label (repository variable
+    # RISCV_RUNNER=riscv64-builder); unset keeps the hosted images.
+    runs-on: ${{ vars.RISCV_RUNNER || 'ubuntu-latest' }}
     outputs:
       targets: ${{ steps.detect.outputs.targets }}
       has_targets: ${{ steps.detect.outputs.has_targets }}
@@ -44,6 +55,7 @@ jobs:
           BASE_REF: ${{ github.base_ref || 'main' }}
           HEAD_SHA: ${{ github.sha }}
           BEFORE_SHA: ${{ github.event.before }}
+          REPUBLISH: ${{ inputs.republish || 'false' }}
         run: python3 scripts/detect_targets.py
 
       - name: Render self-check
@@ -54,7 +66,9 @@ jobs:
     name: build (${{ matrix.target.slug }})
     needs: detect
     if: needs.detect.outputs.has_targets == 'true'
-    runs-on: ubuntu-latest
+    # Self-hosted runners are addressed by one label (repository variable
+    # RISCV_RUNNER=riscv64-builder); unset keeps the hosted images.
+    runs-on: ${{ vars.RISCV_RUNNER || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       max-parallel: 3
@@ -223,6 +237,9 @@ jobs:
           # input says so.
           publish: ${{ needs.detect.outputs.publish == 'true' && vars.SKIP_PUBLISH != 'true' }}
           reuse: ${{ steps.reuse.outputs.hit == 'true' }}
+          # A "publish" target means only the delivery changed: the cached tree is
+          # restored above and nothing is fetched, built or tested again.
+          publish_only: ${{ matrix.target.mode == 'publish' }}
         env:
           # The recipes read NODE_AUTH_TOKEN (npm's canonical variable) and say how
           # to use it, so the secret only has to hold the credential. The test

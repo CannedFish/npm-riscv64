@@ -23,6 +23,14 @@ Rules:
   the base commit and the head: a template edit that does not change a single executed
   command leaves every key intact and therefore rebuilds nothing (see
   ``narrow_by_build_inputs``). ``scripts/**`` additionally self-checks the renderer.
+* a candidate whose build key is unchanged but whose *publish* key changed is a
+  ``publish`` target: the artifact is what the cache holds, only the delivery changed.
+  Rebuilding it would be waste and, worse, would not happen at all: publishing is
+  skipped when nothing is built, which is how a fixed publish step once stayed
+  undelivered.
+
+``REPUBLISH=true`` (workflow_dispatch only) makes every recipe a ``publish`` target,
+so a delivery fix can be rolled out without touching a recipe.
 """
 
 from __future__ import annotations
@@ -137,10 +145,18 @@ def path_rules(
 
 
 def merge(*groups: list[rl.Target]) -> list[rl.Target]:
-    """Union of target lists, sorted and de-duplicated."""
+    """Union of target lists, sorted and de-duplicated.
+
+    A recipe that needs a build wins over the same recipe needing only a publish: the
+    build mode runs the publish step as well, so keeping the weaker mode would drop the
+    build.
+    """
     selected: dict[tuple[str, str], rl.Target] = {}
     for group in groups:
         for target in group:
+            previous = selected.get((target.pkg, target.ver))
+            if previous is not None and previous.mode == "build":
+                continue
             selected[(target.pkg, target.ver)] = target
     return [selected[key] for key in sorted(selected)]
 
@@ -204,14 +220,39 @@ def narrow_by_build_inputs(
         # Prefer the tool that the base revision shipped: then a renderer change shows up
         # as a changed key. Older bases have no tool; use ours on their tree instead.
         base_tool = base_dir / BUILD_KEY_TOOL
+        base_tool_command: list[str] = []
         if base_tool.is_file():
             command_prefix = [sys.executable, str(base_tool)]
+            base_tool_command = command_prefix
         elif tool.is_file():
             command_prefix = [sys.executable, str(tool)]
         else:
             print("# no build_key tool available to compare with", file=sys.stderr)
             return None
         template = str(base_dir / template_path)
+
+        # The publish key is asked of the base's own tool first, so a renderer change
+        # shows up here too. A base that predates the flag cannot answer it; then our
+        # tool is used on the base tree, which still catches a changed recipe or
+        # template but not a changed renderer.
+        def publish_key_commands() -> list[list[str]]:
+            commands = []
+            if base_tool_command:
+                commands.append(base_tool_command)
+            if tool.is_file():
+                commands.append([sys.executable, str(tool)])
+            return commands
+
+        def base_publish_key(target: "rl.Target") -> str | None:
+            for prefix in publish_key_commands():
+                result = subprocess.run(
+                    [*prefix, "--root", str(base_dir), "--template", template,
+                     "--pkg", target.pkg, "--ver", target.ver, "--publish-key"],
+                    capture_output=True, text=True, check=False,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip().splitlines()[-1]
+            return None
 
         kept: list[rl.Target] = []
         for target in candidates:
@@ -233,6 +274,9 @@ def narrow_by_build_inputs(
                 head_key = build_key.build_key(
                     cwd, target.pkg, target.ver, template=cwd / template_path
                 )
+                head_publish = build_key.publish_key(
+                    cwd, target.pkg, target.ver, template=cwd / template_path
+                )
             except Exception as exc:  # noqa: BLE001 - keep the recipe on any surprise
                 print(f"# {target.ident}: cannot compute the head key ({exc}), keeping it", file=sys.stderr)
                 kept.append(target)
@@ -243,11 +287,28 @@ def narrow_by_build_inputs(
                     file=sys.stderr,
                 )
                 kept.append(target)
-            else:
+                continue
+            base_publish = base_publish_key(target)
+            if base_publish is None:
                 print(
-                    f"# {target.ident}: build inputs unchanged (key {head_key}), skipping",
+                    f"# {target.ident}: build inputs unchanged (key {head_key}), "
+                    "cannot compare publish inputs, skipping the build and not re-publishing",
                     file=sys.stderr,
                 )
+                continue
+            if base_publish != head_publish:
+                print(
+                    f"# {target.ident}: build inputs unchanged (key {head_key}), "
+                    f"publish inputs changed ({base_publish} -> {head_publish}): "
+                    "restoring the cached tree and publishing only",
+                    file=sys.stderr,
+                )
+                kept.append(rl.Target(pkg=target.pkg, ver=target.ver, path=target.path, mode="publish"))
+                continue
+            print(
+                f"# {target.ident}: build inputs unchanged (key {head_key}), skipping",
+                file=sys.stderr,
+            )
         return kept
     finally:
         try:
@@ -284,6 +345,8 @@ def target_payload(target: "rl.Target", stat: dict) -> dict:
         "toolchain": rl.toolchain_kind(stat),
         "artifact_glob": glob,
         "artifact_dir": str(Path(glob).parent).replace("\\", "/") if glob else "",
+        # "build" or "publish": the workflow restores a cached tree for the latter.
+        "mode": getattr(target, "mode", "build"),
     }
 
 
@@ -306,8 +369,25 @@ def main(cwd: Path | None = None) -> int:
         return 2
 
     explicit, candidates, self_check = path_rules(root, changed, template_path, rebuild_all)
-    targets = merge(explicit, candidates)
-    if candidates and any(path.startswith("docker/") for path in changed):
+
+    republish = os.environ.get("REPUBLISH", "").lower() in ("1", "true", "yes")
+    if republish and event == "workflow_dispatch":
+        # Every recipe, publish only: no build input changed, the cache holds the trees.
+        # This is the lever for rolling out a delivery fix - a publish step that had
+        # never run, a registry that moved - without touching a single recipe.
+        targets = [
+            rl.Target(pkg=t.pkg, ver=t.ver, path=t.path, mode="publish")
+            for t in rl.enumerate_targets(root)
+        ]
+        print(
+            f"# republish requested: {len(targets)} recipe(s) publish from the cache",
+            file=sys.stderr,
+        )
+        explicit = []
+        candidates = []
+    else:
+        targets = merge(explicit, candidates)
+    if not republish and candidates and any(path.startswith("docker/") for path in changed):
         # The toolchain itself changed. Its effect reaches the key through the image id,
         # which is only known after the image is rebuilt, so nothing here can be narrowed
         # away: build everything and let the build job's key decide about the cache.
@@ -315,7 +395,7 @@ def main(cwd: Path | None = None) -> int:
             "# toolchain changed: every recipe is kept, the image digest is resolved later",
             file=sys.stderr,
         )
-    elif candidates:
+    elif not republish and candidates:
         narrowed = narrow_by_build_inputs(
             root,
             template_path,
@@ -333,6 +413,17 @@ def main(cwd: Path | None = None) -> int:
             # run even when its artifact would be identical.
             targets = merge(explicit, narrowed)
 
+    publish_allowed = event == "push" or (event == "workflow_dispatch" and republish)
+    if not publish_allowed:
+        dropped = [target for target in targets if target.mode == "publish"]
+        if dropped:
+            print(
+                "# publish step changed but this run cannot publish "
+                f"({event}): {len(dropped)} recipe(s) have nothing to build",
+                file=sys.stderr,
+            )
+        targets = [target for target in targets if target.mode != "publish"]
+
     problems = rl.repository_problems(root) + verify_recipes(targets)
     if problems:
         print("error: the recipe tree is not valid, refusing to build:", file=sys.stderr)
@@ -349,8 +440,9 @@ def main(cwd: Path | None = None) -> int:
             return 1
         payload.append(target_payload(t, stat))
     compact = json.dumps(payload, separators=(",", ":"))
-    # publish is only allowed after the merge lands on the default branch (D5).
-    publish = "true" if (event == "push" and payload) else "false"
+    # publish is only allowed after the merge lands on the default branch (D5), or when
+    # an operator explicitly asks for a re-delivery of the cached trees.
+    publish = "true" if (publish_allowed and payload) else "false"
     outputs = {
         "targets": compact,
         "has_targets": "true" if payload else "false",
@@ -361,7 +453,7 @@ def main(cwd: Path | None = None) -> int:
 
     print(f"# event={event} changed={len(changed)} targets={len(payload)} self_check={self_check}")
     for entry in payload:
-        print(f"  - {entry['pkg']}@{entry['ver']}  ({entry['dir']})")
+        print(f"  - {entry['pkg']}@{entry['ver']}  ({entry['dir']})  [{entry['mode']}]")
 
     for key, value in outputs.items():
         print(f"{key}={value}")

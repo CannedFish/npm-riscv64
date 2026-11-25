@@ -31,6 +31,10 @@ inputs:
     description: "The workspace tree was restored from the build cache: skip fetch, patch and build"
     required: false
     default: "false"
+  publish_only:
+    description: "Only deliver: the tree comes from the cache, nothing is built or tested again"
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -110,6 +114,7 @@ runs:
     # recipe's own data files: the riscv64 skip list lives next to the recipe it
     # belongs to (tests/riscv64-skip.txt), never in the test script.
     - name: test
+      if: inputs.publish_only != 'true'
       shell: bash
       run: |
         set -euo pipefail
@@ -123,6 +128,18 @@ runs:
 
     # 5/5 - publish: runs on the host, no emulation needed to move files and
     # talk to a registry.
+    # Publish-only means "deliver the tree the cache holds". Without that tree there is
+    # nothing to deliver, and publishing a half-fetched workspace would ship the wrong
+    # package - so this combination fails before the publish step runs.
+    - name: require the cached tree for publish-only
+      if: inputs.publish == 'true' && inputs.publish_only == 'true' && inputs.reuse != 'true'
+      shell: bash
+      run: |
+        echo "ERROR: publish-only was requested, but no build tree was restored." >&2
+        echo "  Nothing would be published, or worse, a stale tree would be." >&2
+        echo "  Build that recipe again first, then re-publish." >&2
+        exit 1
+
     - name: publish
       if: inputs.publish == 'true'
       shell: bash

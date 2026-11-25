@@ -77,9 +77,10 @@ class GitFixture:
     def common(self, pkg: str) -> None:
         self.write(f"packages/{pkg}/common/commands/build", "echo common\n")
 
-    def commit(self, message: str = "change") -> str:
+    def commit(self, message: str = "change", allow_empty: bool = False) -> str:
         git(self.root, "add", "-A")
-        git(self.root, "commit", "-qm", message)
+        args = ["commit", "-qm", message] + (["--allow-empty"] if allow_empty else [])
+        git(self.root, *args)
         return git(self.root, "rev-parse", "HEAD").strip()
 
     def mark_origin_main(self, sha: str) -> None:
@@ -315,10 +316,12 @@ class BuildInputNarrowingTests(unittest.TestCase):
             "explicit": [(t.pkg, t.ver) for t in explicit],
             "self_check": self_check,
             "compared": narrowed is not None,
+            "modes": {(t.pkg, t.ver): t.mode for t in targets},
         }
 
-    def run_main(self, *, event: str, before: str) -> dict:
-        head = self.repo.commit("feature change")
+    def run_main(self, *, event: str, before: str, republish: str = "") -> dict:
+        # A manual republish changes nothing in the tree, so the commit may be empty.
+        head = self.repo.commit("feature change", allow_empty=True)
         output = self.root / "github_output"
         output.write_text("", encoding="utf-8")
         env = dict(os.environ)
@@ -330,6 +333,7 @@ class BuildInputNarrowingTests(unittest.TestCase):
             GITHUB_OUTPUT=str(output),
             RECIPE_ROOT="packages",
             TEMPLATE_PATH=TEMPLATE,
+            REPUBLISH=republish,
         )
         saved = dict(os.environ)
         os.environ.update(env)
@@ -391,6 +395,34 @@ class BuildInputNarrowingTests(unittest.TestCase):
         result = self.detect()
         self.assertTrue(result["compared"])
         self.assertEqual(result["targets"], [])
+
+    def test_a_publish_step_change_redelivers_without_building(self):
+        # The delivery changed; the artifact did not. Rebuilding would be waste, and
+        # doing nothing is what used to happen when a publish fix landed.
+        self.insert_after_step_start("publish", 'echo "[publish] replaced"')
+        result = self.detect()
+        self.assertEqual(sorted(result["targets"]), self.everything)
+        self.assertEqual(set(result["modes"].values()), {"publish"})
+
+    def test_publish_only_targets_are_dropped_when_the_run_cannot_publish(self):
+        self.insert_after_step_start("publish", 'echo "[publish] replaced"')
+        payload = self.run_main(event="pull_request", before="")
+        self.assertEqual(payload, [])
+
+    def test_publish_only_targets_survive_on_a_push(self):
+        self.insert_after_step_start("publish", 'echo "[publish] replaced"')
+        payload = self.run_main(event="push", before=self.repo_previous_commit())
+        self.assertEqual(
+            sorted((entry["pkg"], entry["ver"], entry["mode"]) for entry in payload),
+            [(pkg, ver, "publish") for pkg, ver in self.everything],
+        )
+
+    def test_republish_publishes_every_recipe_from_the_cache(self):
+        payload = self.run_main(event="workflow_dispatch", before="", republish="true")
+        self.assertEqual(
+            sorted((entry["pkg"], entry["ver"], entry["mode"]) for entry in payload),
+            [(pkg, ver, "publish") for pkg, ver in self.everything],
+        )
 
     def test_new_branch_still_rebuilds_everything(self):
         # No base commit to compare with: fall back to building every recipe.

@@ -1023,3 +1023,18 @@ rolldown 只需要交叉 gcc 做链接，不涉及该限制。
   单测用 PATH 上的桩 npm 覆盖六个分支（含 npm ≥11 的 object 形 pack 输出）。
 * 已知代价：每次发布多一次 `npm pack`（对 19.5 MB 绑定约 1 秒）和一次 `npm view`；换来的是「静默没发出去」
   这类事故变成红的构建。
+
+### D38 发布侧改动必须能触发交付：publish key 与 `publish` 模式
+
+* 事实：build key 有意不含发布侧（D16/§13.11），而发布步骤本身就是交付物。于是「只改发布脚本」时
+  `targets=[]`、`has_targets=false`，整个作业被跳过，修好的发布逻辑永远送不出去（L3 实测复现）。
+* 决策：引入第二个 key（`publish_key`：渲染后 publish 步骤 + `steps/publish.sh` + `manifest.mjs`），
+  检测器按两个 key 给出三种 mode（`build` / `publish` / 跳过）；`publish` 目标从缓存树交付，
+  不重建、不重测。`merge()` 中 `build` 优先。
+* `publish` 目标只在允许发布时产生（push→main、或 `workflow_dispatch` + `republish`），PR 里丢弃。
+* 手动杠杆：`workflow_dispatch` 的 `republish` 输入把全部配方标成 `publish`——交付修复不需要碰配方。
+* 守卫：action 的 `publish_only` 模式要求 `reuse==true`，否则在 publish 之前硬失败（拿没恢复的树去发
+  = 发错包）。
+* 顺带：`runs-on` 支持 `RISCV_RUNNER` 变量（自维护 runner 只需一个标签，不改 workflow），README 增补
+  「Running it in a fork」与「Self-hosted runners」两节，并把仓库地址改为占位符（当前 `.stat` 指向的是
+  测试仓库，直接展示会误导）。
