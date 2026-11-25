@@ -125,28 +125,45 @@ publish_pkg() {
   #
   # The output is streamed rather than captured: a slow upload otherwise looks frozen
   # in the log until npm exits, which is exactly how a stuck publish reads.
+  # --force is not about ignoring errors: npm >= 11 refuses, client-side and before
+  # sending anything, to publish a version the registry already knows ("You cannot
+  # publish over the previously published versions"). A mirror carrying upstream's
+  # release always answers that way, and the refuse-to-replace rule is the wrong rule
+  # here: the tarball this recipe publishes is upstream's release plus the riscv64
+  # increment, so replacing it is the whole point. Letting the registry decide costs
+  # one round trip and tells the truth either way (see the assertion below).
   local out_file status
   out_file="$(mktemp)"
   set +e
-  npm publish "$abs_dir" --registry "$P_REGISTRY" --access public \
+  npm publish "$abs_dir" --registry "$P_REGISTRY" --access public --force \
     --ignore-scripts --no-audit --no-fund --loglevel http 2>&1 |
     tee "$out_file"
   status=${PIPESTATUS[0]}
   set -e
+  local refused=""
   if [ $status -eq 0 ]; then
-    rm -f "$out_file"
     log "published $P_NAME@$P_VERSION"
-    return 0
+  elif grep -qE "EPUBLISHCONFLICT|409 Conflict|already exists|previously published|cannot publish over" "$out_file"; then
+    refused="yes"
+    log "the registry refused to replace $P_NAME@$P_VERSION; checking what it serves"
+  else
+    log "publish failed: $P_NAME@$P_VERSION"
+    printf '%s\n' "$out_file" >&2
+    log "registry answer is in $out_file"
+    return 1
   fi
-  if grep -qE "EPUBLISHCONFLICT|409 Conflict|already exists|previously published|cannot publish over" "$out_file"; then
-    rm -f "$out_file"
-    log "already published: $P_NAME@$P_VERSION (the registry refused a second publish; skipped)"
-    return 0
+  rm -f "$out_file"
+
+  # The upload being accepted is not the same claim as the registry serving our bytes,
+  # and only the second one matters to a consumer. A refused publish whose version
+  # already holds someone else's artifact stops the step here instead of passing as
+  # "already published" - that is how a green build once left the mirror serving
+  # upstream's package without the riscv64 increment.
+  node "$STEPS_DIR/manifest.mjs" --assert-served "$spec_json" "$abs_dir" || return 1
+  if [ -n "$refused" ]; then
+    log "already published: $P_NAME@$P_VERSION (identical artifact, nothing to do)"
   fi
-  log "publish failed: $P_NAME@$P_VERSION"
-  printf '%s\n' "$out_file" >&2
-  log "registry answer is in $out_file"
-  return 1
+  return 0
 }
 
 # Credentials first: publishing may need auth before it can answer.
