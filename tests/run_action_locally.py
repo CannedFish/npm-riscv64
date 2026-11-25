@@ -32,17 +32,32 @@ STEPS_DIR = ".rendered/action"
 
 
 def evaluate_if(condition: str | None, **inputs: bool) -> bool:
-    """Evaluate the small subset of `if:` expressions the template uses."""
+    """Evaluate the small subset of `if:` expressions the template uses.
+
+    Supported: a single ``inputs.<name> (==|!=) 'true'`` clause, or an ``&&`` chain of
+    them - which is what the template is allowed to contain, so a more elaborate
+    expression is a template bug worth failing on rather than guessing at.
+    """
     if not condition:
         return True
     text = condition.strip()
-    for name, value in inputs.items():
-        for quote in ("'", '"'):
-            if text == f"inputs.{name} == {quote}true{quote}":
-                return value
-            if text == f"inputs.{name} != {quote}true{quote}":
-                return not value
-    raise SystemExit(f"unsupported if condition in the action template: {text}")
+    for clause in (part.strip() for part in text.split("&&")):
+        if not clause:
+            continue
+        matched = False
+        for name, value in inputs.items():
+            for quote in ("'", '"'):
+                if clause == f"inputs.{name} == {quote}true{quote}":
+                    matched = True
+                    if not value:
+                        return False
+                elif clause == f"inputs.{name} != {quote}true{quote}":
+                    matched = True
+                    if value:
+                        return False
+        if not matched:
+            raise SystemExit(f"unsupported if condition in the action template: {clause}")
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,6 +72,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", help="comma separated step names to run (substring match)")
     parser.add_argument("--skip", help="comma separated step names to skip (substring match)")
     parser.add_argument("--publish", action="store_true", help="also run the publish step")
+    parser.add_argument(
+        "--publish-only",
+        action="store_true",
+        help="behave like a cached re-delivery: skip fetch/patch/build/test, publish only",
+    )
     parser.add_argument(
         "--reuse",
         action="store_true",
@@ -158,7 +178,12 @@ def main(argv: list[str] | None = None) -> int:
         if "run" not in step:
             print(f"\n=== skipping non-run step: {name}")
             continue
-        if not evaluate_if(step.get("if"), publish=args.publish, reuse=args.reuse):
+        if not evaluate_if(
+            step.get("if"),
+            publish=args.publish,
+            reuse=args.reuse,
+            publish_only=args.publish_only,
+        ):
             print(f"\n=== skipped by if-condition: {name}")
             continue
         if only and not any(token in name for token in only):

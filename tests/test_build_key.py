@@ -293,5 +293,68 @@ class RealRepositoryKeyTests(unittest.TestCase):
         self.assertIn("node-gyp rebuild", joined)
 
 
+class PublishKeyTests(unittest.TestCase):
+    """The publish key answers a different question than the build key.
+
+    It decides whether an already-built tree has to be delivered again after only the
+    delivery side changed - the case that went unnoticed when a fixed publish step
+    triggered nothing at all.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = CacheRepo(Path(self._tmp.name))
+        self.repo.scaffold()
+        self.repo.write("scripts/publish_manifest.mjs", "// helper\n")
+        self.repo.recipe("demo")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def publish_key(self, pkg: str = "demo") -> str:
+        return build_key.publish_key(self.repo.root, pkg, "1.0.0")
+
+    def build_key(self, pkg: str = "demo") -> str:
+        return build_key.build_key(self.repo.root, pkg, "1.0.0")
+
+    def test_publish_key_ignores_the_build_side(self):
+        before = self.publish_key()
+        self.repo.write("packages/demo/1.0.0/commands/build", "npm run build:other\n")
+        self.assertNotEqual(before, self.build_key())
+        self.assertEqual(before, self.publish_key())
+
+    def test_publish_key_follows_the_target_registry(self):
+        # Where a package is published cannot change the artifact, so the build key
+        # holds while the publish key moves - that is exactly the narrowing the
+        # detector relies on.
+        before_build = self.build_key()
+        before_publish = self.publish_key()
+        self.repo.write(
+            "packages/demo/1.0.0/.stat",
+            STAT.replace("registry: https://example.invalid", "registry: https://other.invalid"),
+        )
+        self.assertEqual(before_build, self.build_key())
+        self.assertNotEqual(before_publish, self.publish_key())
+
+    def test_publish_key_changes_when_the_publish_step_text_changes(self):
+        before = self.publish_key()
+        self.repo.rewrite_template(
+            lambda text: text.replace('bash "{{steps.dir}}/steps/publish.sh"', 'echo probe')
+        )
+        self.assertNotEqual(before, self.publish_key())
+
+    def test_publish_key_ignores_the_test_step(self):
+        before = self.publish_key()
+        self.repo.rewrite_template(
+            lambda text: text.replace("bash \"{{steps.dir}}/steps/test.sh\"", "true")
+        )
+        self.assertEqual(before, self.publish_key())
+
+    def test_publish_key_follows_the_helper(self):
+        before = self.publish_key()
+        self.repo.write("scripts/publish_manifest.mjs", "// helper, changed\n")
+        self.assertNotEqual(before, self.publish_key())
+
+
 if __name__ == "__main__":
     unittest.main()

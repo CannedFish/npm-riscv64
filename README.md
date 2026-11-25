@@ -121,7 +121,7 @@ docker push ghcr.io/<owner>/npm-riscv64-toolchain:riscv64
 docker push ghcr.io/<owner>/npm-riscv64-toolchain:cross
 ```
 
-`ghcr.io/<owner>/...` must be lowercase, so `CannedFish` becomes `cannedfish`. The
+`ghcr.io/<owner>/...` must be lowercase, so `RuyiRepo` becomes `ruyirepo`. The
 `build toolchain images` workflow does the same on a runner
 (`Actions -> build toolchain images -> Run workflow`); run it again whenever a
 `docker/*.Dockerfile` changes.
@@ -157,18 +157,122 @@ unlinked, and the workflow token then keeps read-only access - the push fails wi
 
 ## Running it in a fork
 
+Development happens in a fork; the repository itself lives at `RuyiRepo/ruyirepo`,
+and nothing here is pushed there directly. A fork is also the only place the whole
+pipeline can be exercised: L0-L2 run locally, but a real GitHub Actions run and a real
+registry publish exist nowhere else (that is "L3" in the tables above).
+
+Setup, in order:
+
+1. **Fork** `RuyiRepo/ruyirepo` into the account that will run the tests, and work on a
+   branch there.
+2. **Toolchain images.** Run `Actions -> build toolchain images -> Run workflow` once,
+   so `ghcr.io/<fork-owner>/npm-riscv64-toolchain:riscv64` (and `:cross`) exist. Public
+   packages pull anonymously; if a package is private, connect it to the fork or add a
+   `GHCR_TOKEN` secret (see the section above).
+3. **Registry credential.** `gh secret set NPM_PUBLISH_TOKEN --repo <fork-owner>/npm-riscv64`
+   with the value the recipe's registry expects (`auth: basic` -> base64 of
+   `user:password`, `auth: token` -> the token itself). Without this secret everything
+   still builds and tests; only the publish step stops.
+4. **Optional variables**, for pointing the run somewhere else without editing recipes:
+
+   | variable | why |
+   | --- | --- |
+   | `PUBLISH_REGISTRY` | publish to another registry than the one `.stat` names |
+   | `PUBLISH_SCOPE` | rewrite every publish target to `@<scope>/...` (GitHub Packages needs it to equal the owner) |
+   | `SKIP_PUBLISH` | `true` keeps the build running and skips publishing |
+   | `RISCV_IMAGE`, `RISCV_CROSS_IMAGE` | use your own toolchain images |
+   | `RISCV_RUNNER` | send the jobs to a self-hosted runner (see the next section) |
+
+What a run does:
+
+* **pull request** - detect, fetch, patch, build, test. No publishing: the merge is the
+  approval gate (D5).
+* **push to `main`** - the same, plus publishing. A recipe whose artifact did not change
+  but whose publish step did is delivered again from the cached tree, without rebuilding.
+* **`workflow_dispatch` with `republish`** - publish every recipe from the cached trees
+  and build nothing. This is the lever for a delivery fix: publishing is verified by
+  reading back what the registry serves, so a registry that rejected an earlier push
+  fails loudly here instead of staying quietly wrong.
+
+Things that surprise people the first time:
+
+* the first run of a recipe is slow (qemu, plus `npm i` inside the container); later
+  runs reuse the cached tree, keyed by the recipe, the template, the renderer and the
+  image id;
+* a red publish step does not mean the build is broken - the four build steps finished
+  before it, and their artifacts are uploaded regardless;
+* the fork's `main` is what publishes. A run on a feature branch never publishes, so a
+  branch has to be merged into the fork's `main` to see the delivery end to end;
+* the registry credential belongs to whoever administers the target registry. A fork
+  cannot publish to `RuyiRepo`'s registry just by existing - it needs a credential that
+  repository accepts, or `PUBLISH_REGISTRY` pointing at its own.
+
+## Self-hosted runners
+
+The workflow runs on `ubuntu-latest` by default, which costs minutes of emulation:
+qemu runs the riscv64 container everywhere, and a Rust workspace (rolldown) spends
+most of its time in the emulated compiler. A self-hosted runner removes that - on a
+riscv64 host the containers run natively - and is the intended setup for real use.
+
+Requirements on the runner:
+
+| what | why |
+| --- | --- |
+| Docker, and the runner user in the `docker` group | every build and test step is a container |
+| `riscv64` binfmt when the host is not riscv64 | otherwise `docker run --platform linux/riscv64` fails immediately; on a riscv64 host it is native and costs nothing |
+| `gh` CLI on `PATH`, authenticated or with `GH_TOKEN` | the cache restore asks the artifacts API which run holds the tree |
+| ~50 GB disk, 8 cores, 16 GB RAM for a native riscv64 host | rolldown's cargo build and the toolchain images are the heavy part |
+| network access to the registry and to GHCR | toolchain images and upstream tarballs come from outside |
+
+Register it with a label, so the workflow can name exactly that runner:
+
+```bash
+# on the runner host, with a token from Settings -> Actions -> Runners
+./config.sh --url https://github.com/RuyiRepo/ruyirepo \
+            --token <registration-token> \
+            --name riscv64-builder --labels riscv64-builder
+sudo ./svc.sh install && sudo ./svc.sh start      # or run ./run.sh by hand
+```
+
+Then set the repository variable `RISCV_RUNNER=riscv64-builder`; `build.yml` uses it
+for both jobs (`runs-on: ${{ vars.RISCV_RUNNER || 'ubuntu-latest' }}`), so a self-hosted
+setup needs no workflow edit. Leaving it unset keeps the hosted runners.
+
+Two things a self-hosted runner changes about the build:
+
+* **images are reused.** A hosted runner starts empty and pulls the toolchain image
+  every time; a self-hosted one keeps it, so pre-pull once per host
+  (`docker pull --platform linux/riscv64 ghcr.io/<owner>/npm-riscv64-toolchain:riscv64`)
+  and point `RISCV_IMAGE` / `RISCV_CROSS_IMAGE` at that tag. The build cache key
+  includes the image id, so a re-pulled (different) image invalidates the cached
+  trees - correct, and worth knowing when a run unexpectedly rebuilds;
+* **`--user` mapping.** Containers run as the calling user (the runner user), and the
+  workspace belongs to it too; a runner started as a system service with a different
+  uid than the checkout can leave unreadable files. Keep the service user and the
+  work directory owner the same.
+
+With qemu absent and a riscv64 host, nothing else is needed: the recipes' `toolchain:
+native` becomes a native build, and only a `cross` recipe still uses the amd64 image.
+
 ## Publishing
 
-The recipes publish to `https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local`
-under the **upstream names**, unscoped (`bufferutil`, `utf-8-validate`, `rolldown`).
-That naming is deliberate: a consumer whose npm resolves those names from a registry
-carrying these recipes gets riscv64 support without renaming a single import.
+Every recipe names its registry in `.stat`; the examples below use
+`https://npm.example.com/repository/npm-local` as a stand-in for it - read that as
+"the registry you publish to", not as an address this repository ships. (While the
+model is being validated the `.stat` files point at an internal test repository, and
+that address is a placeholder: it promises nothing about content or availability.)
+
+Packages are published under the **upstream names**, unscoped (`bufferutil`,
+`utf-8-validate`, `rolldown`). That naming is deliberate: a consumer whose npm resolves
+those names from a registry carrying these recipes gets riscv64 support without
+renaming a single import.
 
 The registry answers `401` with `WWW-Authenticate: Basic`, so the credential is HTTP
 Basic, not an npm bearer token. Each `.stat` says how to send it:
 
 ```yaml
-    registry: https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local
+    registry: https://npm.example.com/repository/npm-local
     token_env: NODE_AUTH_TOKEN
     auth: basic        # token -> "_authToken", basic -> "_auth" (base64 user:password)
 ```
@@ -178,7 +282,7 @@ Basic, not an npm bearer token. Each `.stat` says how to send it:
 credential key from `new URL(".", registryUrl)`, so a missing slash makes npm look one
 path segment higher and fail with `ENEEDAUTH` before sending anything), and writes the
 matching line into a throwaway `.npmrc`
-(`//forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/:_auth=...`, keyed by
+(`//npm.example.com/repository/npm-rv-test-local/:_auth=...`, keyed by
 the full registry URL, path included). To get a credential, log in to the registry UI
 with your account and take the base64 form:
 
@@ -221,8 +325,8 @@ consumer tries it:
   the tarball instead of the metadata:
 
   ```ini
-  registry=https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/
-  //forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/:_auth=<base64>
+  registry=https://npm.example.com/repository/npm-local/
+  //npm.example.com/repository/npm-rv-test-local/:_auth=<base64>
   @rolldown:registry=https://registry.npmjs.org/
   @oxc-project:registry=https://registry.npmjs.org/
   replace-registry-host=never
@@ -239,8 +343,8 @@ consumer tries it:
   project copy with `npx rolldown` - and check what actually landed:
 
   ```
-  npm i -g rolldown@1.3.3 --registry=https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-group
-  ls -l /usr/local/lib/node_modules/rolldown/dist/shared/*.node   # the riscv64 binding must be there
+  npm i -g rolldown@1.3.3 --registry=https://npm.example.com/repository/npm-group
+  ls -l /usr/local/lib/node_modules/@rolldown/binding-linux-riscv64-gnu/*.node   # the binding
   rolldown src/main.js --file bundle.js
   ```
 

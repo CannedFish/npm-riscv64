@@ -194,9 +194,32 @@ class RecipeTests(unittest.TestCase):
                 "inputs.reuse != 'true'",
                 f"{name} must be skipped when the tree came from the cache",
             )
-        self.assertNotIn("if", steps["test"])
+        # The test step is the one that must NOT be skipped on a cache hit, but it is
+        # skipped when the run only re-delivers a cached tree (publish_only).
+        self.assertEqual(steps["test"].get("if"), "inputs.publish_only != 'true'")
         self.assertEqual(steps["publish"].get("if"), "inputs.publish == 'true'")
         self.assertEqual(action["inputs"]["reuse"].get("default"), "false")
+        self.assertEqual(action["inputs"]["publish_only"].get("default"), "false")
+
+    def test_publish_only_refuses_to_run_without_a_cached_tree(self):
+        # Publishing a workspace that was never restored would ship a wrong package,
+        # so the combination fails loudly instead of publishing whatever is there.
+        self.repo.add_recipe("demo", "1.0.0")
+        rendered, _ = self.render("demo", "1.0.0")
+        action = yaml.safe_load(rendered)
+        steps = {step.get("name"): step for step in action["runs"]["steps"]}
+        guard = steps["require the cached tree for publish-only"]
+        self.assertEqual(
+            guard.get("if"),
+            "inputs.publish == 'true' && inputs.publish_only == 'true' && inputs.reuse != 'true'",
+        )
+        steps_before_publish = [
+            step.get("name") for step in action["runs"]["steps"]
+        ]
+        self.assertLess(
+            steps_before_publish.index("require the cached tree for publish-only"),
+            steps_before_publish.index("publish"),
+        )
 
     def test_scoped_slug_and_artifact_name(self):
         self.repo.add_recipe("@demo/pkg", "1.2.3")

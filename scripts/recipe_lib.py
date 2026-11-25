@@ -85,11 +85,21 @@ class RecipeError(Exception):
 
 @dataclass(frozen=True)
 class Target:
-    """A buildable (package, version) pair."""
+    """A buildable (package, version) pair.
+
+    ``mode`` says what this target needs from the workflow:
+
+    * ``build`` - the artifact changed (or the recipe did): fetch, patch, build, test,
+      then publish;
+    * ``publish`` - only the publish step changed: the tree is the same one the cache
+      already holds, so the workflow restores it and delivers it again without
+      rebuilding or re-testing.
+    """
 
     pkg: str
     ver: str
     path: Path
+    mode: str = "build"
 
     @property
     def slug_pkg(self) -> str:

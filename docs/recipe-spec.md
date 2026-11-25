@@ -461,6 +461,47 @@ On a hit the action receives `reuse: true`, which skips fetch, patch and build. 
 publish runs normally. Any failed lookup (no artifact, expired, API error) falls back
 to a full build.
 
+### 9.1 The publish key, and targets that only deliver
+
+The build key deliberately ignores the publish side, which leaves a hole: fixing the
+publish step changed nothing, so nothing ran, and the fix stayed undelivered (witnessed:
+a fork run reported "build inputs unchanged" for every recipe while the package the
+registry served was still the wrong one). A second key answers the other question -
+**does this tree have to be delivered again?**
+
+`scripts/build_key.py --publish-key` hashes:
+
+* the rendered `run:` block of the `publish` step,
+* the rendered `steps/publish.sh` body (which embeds the resolved publish specs, so the
+  registry, the platform packages and the manifest template are all covered),
+* `scripts/publish_manifest.mjs`, copied into the steps verbatim.
+
+The detector compares both keys against the base commit and labels each target:
+
+| build key | publish key | mode | what the run does |
+| --- | --- | --- | --- |
+| changed | either | `build` | fetch, patch, build, test, publish |
+| unchanged | changed | `publish` | restore the cached tree, publish only |
+| unchanged | unchanged | - | skip |
+
+`publish` targets exist only where publishing is allowed (a push to `main`, or an
+explicit `workflow_dispatch` with `republish: true`); a pull request that only touches
+the publish side has nothing to deliver and builds nothing. `workflow_dispatch` with
+`republish: true` makes *every* recipe a `publish` target - the lever for rolling out a
+delivery fix without touching a recipe.
+
+The action takes `publish_only: true` for those targets: fetch, patch, build and test
+are skipped, and a guard step fails before publishing when `reuse` is not `true`, because
+delivering a tree that was never restored would ship an empty or stale package. The
+local runner reproduces both paths:
+
+```bash
+python3 tests/run_action_locally.py --pkg bufferutil --ver 4.2.0 \
+  --publish --publish-only --reuse          # skips fetch/build/test, publishes
+python3 tests/run_action_locally.py --pkg bufferutil --ver 4.2.0 \
+  --publish --publish-only                  # fails in the guard, as it should
+```
+
 ## 10. Verifying locally
 
 | level | command | what it proves |
