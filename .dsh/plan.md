@@ -1038,3 +1038,21 @@ rolldown 只需要交叉 gcc 做链接，不涉及该限制。
 * 顺带：`runs-on` 支持 `RISCV_RUNNER` 变量（自维护 runner 只需一个标签，不改 workflow），README 增补
   「Running it in a fork」与「Self-hosted runners」两节，并把仓库地址改为占位符（当前 `.stat` 指向的是
   测试仓库，直接展示会误导）。
+
+### D39 发布后的"仓库是否在服务我们的字节"必须读三种形态，且"读不到"≠"不一样"
+
+* 事实：L3 两次都在 201 之后立刻报 "the registry does not serve this artifact … (no integrity)"。
+  根因在客户端：npm ≥12 的 `npm view --json` 输出是一元素**数组**（≤11 是对象），
+  我们把数组当 manifest，`dist` 恒为 undefined；随后又把"字段缺失"当作"摘要不同"，
+  对一个已经 201 接受的上传给出错误指控。
+* 事实（用户补充验证）：目标私仓的版本文档只有 `dist.tarball`，既无 integrity 也无 shasum。
+  所以"读不到"不是边缘情况，而是这家仓库的正常形态。
+* 决策：校验按三层证据降级——`dist.integrity`(sha512) → `dist.shasum`(sha1) →
+  下载 `dist.tarball` 自算 sha512。下载用 npm 的凭据规则（nerf-dart 最长前缀匹配 npmrc）。
+* 决策：结论三态——一致 / 确凿不一致（失败，打印两份摘要）/ 无法验证。
+  无法验证在 **201 之后是 WARNING（不判红）**，在 **被拒之后是失败**（此时没有任何证据
+  表明消费者拿到的是我们的字节）。shell 通过 `--accepted` 传入上传结果。
+* 决策：`PUBLISH_VERIFY=digest` 允许只认摘要不下载（慢链路的显式选择，日志如实声明未验证）；
+  `PUBLISH_VERIFY_MAX_BYTES`（默认 64 MB）限制体积。
+* 教训（写进注释）：凡是"读不回来就把缺失当冲突"的断言，都会在换一个仓库实现时制造假红线；
+  断言必须区分"证据不足"与"证据相反"。npm 版本差异（9/11 对象、12 数组）同理必须双向兼容。
