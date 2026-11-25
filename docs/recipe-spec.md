@@ -316,6 +316,53 @@ recorded in the log.
    answering `WWW-Authenticate: Basic` expects (the value is base64 `user:password`).
 5. `npm publish <absolute dir> --registry <registry> --access public --force --ignore-scripts`.
 
+### 6.4 How long the upload may take
+
+npm's `fetch-timeout` is not a per-read idle timeout: `minipass-fetch` starts one timer
+when the socket is assigned, covering **the upload and the answer together**, and
+npm 9, 11 and 12 behave identically here (verified by publishing the same 9.3 MB
+binding to the same throttled registry with each: abort at the timeout, success above
+it, same error text). The default is 300 s, so for a package carrying a native binding
+the default is a *cap on the route's speed*: 9.3 MB becomes 12.2 MB of base64 JSON, and
+anything slower than ~40 kB/s cannot fit inside 300 s.
+
+What that looks like when it bites (witnessed in the fork's L3 run, npm 12, binding):
+
+```
+npm http fetch PUT ... attempt 1 failed with FETCH_ERROR     (aborted mid-body)
+npm http fetch PUT ... attempt 2 failed with FETCH_ERROR
+npm http fetch PUT ... attempt 3 failed with FETCH_ERROR
+npm error network timeout at: https://<registry>/@rolldown%2fbinding-linux-riscv64-gnu
+```
+
+Three attempts, ~12 MB re-uploaded each time, and the registry logs nothing - a
+buffering proxy in front of it never passes on a request that was never finished, which
+is why the private registry's own log looked empty.
+
+So the step derives the budget from the packed size before publishing
+(`manifest.mjs --plan`, below) and passes it explicitly:
+
+| packed size | fetch timeout | `--fetch-retries` |
+| --- | --- | --- |
+| < 4 MiB | 300 s + (size × 1.4 / 16 kB/s) | npm's default (2) |
+| >= 4 MiB | same formula, capped at 1 h | 1 (a retry re-uploads megabytes) |
+
+Both numbers are logged (`upload 9128369 bytes, fetch timeout 1099000ms`) so a slow
+route is visible instead of invisible, and `PUBLISH_FETCH_TIMEOUT` (milliseconds)
+overrides the formula for an operator who knows the route.
+
+`scripts/publish_manifest.mjs` is the one helper the publish step calls, so the shell
+never builds JSON by hand (one apostrophe in an embedded literal used to break the step
+outright). Each mode prints shell assignments, JSON, or a verdict:
+
+| mode | what it does |
+| --- | --- |
+| `--shell <spec>` | `P_*` assignments the step `eval`s: name, version, registry, kind, base, overlay, platform fields |
+| `--verify-integrity <spec> <tarball>` | sha512 of the base tarball against `base.integrity` |
+| `--prepare <spec> <dir>` | writes `<dir>/package.json` (and `README.md`) for the kind and manifest shape, merging rather than replacing |
+| `--plan <spec> <dir>` | `P_PACKED_BYTES`, `P_FETCH_TIMEOUT`, `P_FETCH_RETRIES`: what the upload will cost |
+| `--assert-served <spec> <dir> [--accepted]` | the verdict about what the registry serves (3 above) |
+
 `name` is identity: publishing a package whose manifest is named differently is refused
 rather than published under a second name - a rename ships "another package", not an
 update, and the original name's consumers get no riscv64 support.
@@ -536,6 +583,7 @@ python3 tests/run_action_locally.py --pkg bufferutil --ver 4.2.0 \
 | --- | --- | --- |
 | L0 | `python3 -m unittest discover -s tests` | renderer, layering, detection, generated YAML validity, golden snapshot (`tests/golden/`, refresh with `python3 tests/regen_golden.py`) |
 | L1 | `python3 tests/run_action_locally.py --pkg bufferutil --ver 4.2.0` | the rendered action really fetches, builds and tests under riscv64 emulation |
+| L0 | `python3 -m unittest tests.test_publish_plan` | the upload budget: size-derived timeout, retry reduction, cap and override |
 | L2 | `python3 tests/l2_publish.py` | publish order, idempotency, manifest merge, identity, partial-failure re-entry against verdaccio (`DSH_L2_PORT=4874` when a leftover container holds the default port); the first publish is a real 201, so this also rehearses the served-bytes assertion |
 | L2 (delivered) | `python3 tests/verify_published.py <pkg> <ver> [--shape …]` | the bytes a registry serves compared with upstream's: file by file, manifest field by field |
 | patches | `python3 scripts/check_patches.py [--network]` | `upstream/*.patch` are real diffs, declared, free of this repository's traces, and still apply |

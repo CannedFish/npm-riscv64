@@ -12,6 +12,7 @@
 //   --verify-integrity <spec> <tarball>   compare sha512 with base.integrity
 //   --prepare <spec> <dir>                write <dir>/package.json (+ README.md)
 //   --assert-served <spec> <dir>          fail unless the registry serves exactly these bytes
+//   --plan <spec> <dir>                   P_PACKED_BYTES / P_FETCH_TIMEOUT for the upload
 //
 // The spec mirrors one npm_publish entry after the renderer resolved it:
 //   { name, version, registry, dir, kind, manifest, base?, overlay?, allow_overwrite?,
@@ -52,7 +53,7 @@ function sameRegistry(left, right) {
 
 const spec =
   mode === "--shell" || mode === "--verify-integrity" || mode === "--prepare" ||
-  mode === "--assert-served"
+  mode === "--assert-served" || mode === "--plan"
     ? readSpec(argv[1])
     : fail("unknown mode: " + mode);
 
@@ -243,7 +244,12 @@ function packedIntegrity(dir) {
   if (!entry || !entry.integrity) {
     return { error: "npm pack reported no integrity" };
   }
-  return { integrity: entry.integrity, shasum: entry.shasum || "", files: entry.files || [] };
+  return {
+    integrity: entry.integrity,
+    shasum: entry.shasum || "",
+    size: Number(entry.size) || 0,
+    files: entry.files || [],
+  };
 }
 
 function servedManifest() {
@@ -266,6 +272,42 @@ function servedManifest() {
 // npm <= 11 prints the version manifest; npm >= 12 prints a one-element list (its
 // "queryable" output). Reading the list as a manifest is what once made a matching
 // digest look like a missing one, so both shapes are normalised here.
+// npm's `fetch-timeout` is a wall clock budget for the whole request - it starts when
+// the socket is assigned and covers the upload as well as the answer, in every npm
+// version from 9 to 12 (minipass-fetch keeps the same timer). The default 300 s
+// therefore caps a publish by the time it takes *to upload*, which for a package
+// carrying a native binding is minutes: 9.3 MB of tarball becomes 12.2 MB of base64
+// JSON, and a route slower than ~40 kB/s cannot fit it in 300 s. npm then aborts
+// mid-body, retries (each attempt re-uploading everything), and the registry never
+// sees a complete request - "the request never arrived" from its point of view.
+//
+// So the budget is derived from the payload instead of assumed: a floor of 300 s
+// (npm's default, correct for ordinary packages) plus what the bytes need at a
+// deliberately pessimistic 8 kB/s, capped at an hour. PUBLISH_FETCH_TIMEOUT overrides
+// it outright, for an operator who knows the route.
+const MIN_FETCH_TIMEOUT_MS = 300_000;
+// The route that carried the 9.3 MB binding in 148 s ran at about 84 kB/s. Assuming
+// 16 kB/s leaves room for a route five times slower than that and still finishes.
+const ASSUMED_BYTES_PER_SECOND = 16_000;
+const MAX_FETCH_TIMEOUT_MS = 3_600_000;
+// Base64 wraps the tarball: the request body is about a third larger than the file.
+const PAYLOAD_INFLATION = 1.4;
+// Above this, a retry re-uploads megabytes for nothing, so npm retries once instead
+// of twice. Below it the default is kept: a retry is cheap and usually a blip.
+const RETRY_ONCE_ABOVE_BYTES = 4 * 1024 * 1024;
+
+function fetchTimeoutFor(bytes, override) {
+  if (override) {
+    const value = Number(override);
+    if (!Number.isFinite(value) || value <= 0) {
+      fail("PUBLISH_FETCH_TIMEOUT must be a positive number of milliseconds");
+    }
+    return Math.round(value);
+  }
+  const transfer = Math.ceil((bytes * PAYLOAD_INFLATION) / ASSUMED_BYTES_PER_SECOND) * 1000;
+  return Math.min(MAX_FETCH_TIMEOUT_MS, MIN_FETCH_TIMEOUT_MS + transfer);
+}
+
 function versionDocument(parsed) {
   if (Array.isArray(parsed)) {
     return parsed.find((entry) => entry && typeof entry === "object") || {};
@@ -349,6 +391,21 @@ function sha1Hex(bytes) {
 
 function sha512Sri(bytes) {
   return "sha512-" + createHash("sha512").update(bytes).digest("base64");
+}
+
+if (mode === "--plan") {
+  // What the upload will cost, decided before it starts: the packed size drives the
+  // fetch timeout, and both are logged so a slow route is visible in the step output.
+  const dir = resolve(argv[2]);
+  const ours = packedIntegrity(dir);
+  if (ours.error) fail("cannot size up this publish: " + ours.error);
+  const timeout = fetchTimeoutFor(ours.size, process.env.PUBLISH_FETCH_TIMEOUT);
+  console.log("P_PACKED_BYTES=" + shellQuote(String(ours.size)));
+  console.log("P_FETCH_TIMEOUT=" + shellQuote(String(timeout)));
+  console.log(
+    "P_FETCH_RETRIES=" +
+      shellQuote(ours.size >= RETRY_ONCE_ABOVE_BYTES ? "1" : "")
+  );
 }
 
 if (mode === "--assert-served") {

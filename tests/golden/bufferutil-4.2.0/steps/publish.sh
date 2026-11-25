@@ -118,6 +118,22 @@ publish_pkg() {
     return 1
   }
 
+  # How long the upload may take is part of the publish, not an afterthought. npm's
+  # `fetch-timeout` covers the whole request - upload included - in every version from
+  # 9 to 12, so its 300 s default silently caps a package by how fast the route is: a
+  # binding-sized tarball (9.3 MB, 12.2 MB of base64 body) needs minutes, and on a
+  # slower route npm aborts mid-body, retries, and the registry never sees a complete
+  # request (witnessed as `PUT ... attempt 1 failed with FETCH_ERROR` and "network
+  # timeout at ..." while the registry logged nothing). The budget is therefore
+  # derived from the packed size (§6.4), and both numbers are logged.
+  local plan assignments2 packed_bytes fetch_timeout fetch_retries
+  assignments2="$(node "$STEPS_DIR/manifest.mjs" --plan "$spec_json" "$publish_dir")" || return 1
+  eval "$assignments2"
+  packed_bytes="$P_PACKED_BYTES"
+  fetch_timeout="$P_FETCH_TIMEOUT"
+  fetch_retries="$P_FETCH_RETRIES"
+  log "upload $packed_bytes bytes, fetch timeout ${fetch_timeout}ms"
+
   # Publish, then read the registry answer instead of trusting a lookup: a registry
   # that proxies or groups another one also serves upstream versions of the same
   # name, so "npm view <name>@<version>" would call our own package published and
@@ -135,9 +151,17 @@ publish_pkg() {
   local out_file status
   out_file="$(mktemp)"
   set +e
-  npm publish "$abs_dir" --registry "$P_REGISTRY" --access public --force \
-    --ignore-scripts --no-audit --no-fund --loglevel http 2>&1 |
-    tee "$out_file"
+  if [ -n "$fetch_retries" ]; then
+    npm publish "$abs_dir" --registry "$P_REGISTRY" --access public --force \
+      --ignore-scripts --no-audit --no-fund --loglevel http \
+      --fetch-timeout "$fetch_timeout" --fetch-retries "$fetch_retries" 2>&1 |
+      tee "$out_file"
+  else
+    npm publish "$abs_dir" --registry "$P_REGISTRY" --access public --force \
+      --ignore-scripts --no-audit --no-fund --loglevel http \
+      --fetch-timeout "$fetch_timeout" 2>&1 |
+      tee "$out_file"
+  fi
   status=${PIPESTATUS[0]}
   set -e
   local refused="" accepted=""

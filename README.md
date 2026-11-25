@@ -295,10 +295,26 @@ The workflow maps `secrets.NPM_PUBLISH_TOKEN` to `NODE_AUTH_TOKEN` for the actio
 adding that secret is the only setup a fork needs. The publish step streams npm's
 output with `--loglevel http`: a 9 MB upload takes a second from a machine next to the
 registry but minutes over a slow route, and a captured npm would show nothing until it
-finished. If the route really is slow, raise npm's `fetch-timeout` (`npm config set
-fetch-timeout 900000`) rather than wondering why the step sits there. A recipe pointed at a bearer-token
-registry (GitHub Packages, Nexus npm tokens) uses `auth: token` instead and the secret
-holds the token verbatim.
+finished.
+
+How long the upload is allowed to take is derived from the package, not from npm's
+default. `fetch-timeout` in npm is one wall-clock budget for the whole request - the
+upload included, in every version from 9 to 12 - so 300 s is really a ceiling on the
+route's speed: a binding-sized tarball (9.3 MB, 12.2 MB once base64-wrapped) cannot
+finish below ~40 kB/s. When that ceiling bites, npm aborts mid-body, retries, and the
+registry logs nothing at all, because it never got a complete request:
+
+```
+npm http fetch PUT ... attempt 1 failed with FETCH_ERROR
+npm error network timeout at: https://<registry>/@rolldown%2fbinding-linux-riscv64-gnu
+```
+
+So the step sizes the package first and passes its own budget
+(`upload 9128369 bytes, fetch timeout 1099000ms`), with one retry instead of two above
+4 MB because a retry re-uploads the whole body. `PUBLISH_FETCH_TIMEOUT` (milliseconds)
+overrides that for a route you know. A recipe pointed at a bearer-token registry
+(GitHub Packages, Nexus npm tokens) uses `auth: token` instead and the secret holds the
+token verbatim.
 
 Repository variables override the recipes at render time, so a fork can publish
 somewhere else without editing them:

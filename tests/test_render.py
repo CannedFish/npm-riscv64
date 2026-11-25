@@ -729,6 +729,17 @@ class PublishAuthTests(unittest.TestCase):
         self.assertIn("--loglevel http", script)
         self.assertIn("status=${PIPESTATUS[0]}", script)
 
+    def test_the_upload_budget_is_derived_and_passed_to_npm(self):
+        script = self._publish([self._entry()])
+        # npm's fetch-timeout is a wall-clock budget for the whole request, upload
+        # included, so the default 300 s caps a package by the route's speed; the step
+        # derives it from the packed size and says what it chose.
+        self.assertIn("--plan \"$spec_json\" \"$publish_dir\"", script)
+        self.assertIn("upload $packed_bytes bytes, fetch timeout ${fetch_timeout}ms", script)
+        self.assertIn('--fetch-timeout "$fetch_timeout"', script)
+        # Retries cost a full re-upload, so a large package retries once.
+        self.assertIn('--fetch-retries "$fetch_retries"', script)
+
     def test_idempotency_trusts_the_registry_answer_not_a_lookup(self):
         script = self._publish([self._entry()])
         # A lookup would be fooled by a proxy/group registry serving upstream versions.
