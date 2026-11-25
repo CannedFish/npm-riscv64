@@ -71,6 +71,8 @@ test fails, read the diff - when the change is intended, refresh the snapshot wi
 | L0 | `python3 -m unittest discover -s tests` | renderer, layering, change detection, rendered YAML validity, golden snapshot of the reference recipe |
 | L1 | `python3 tests/run_action_locally.py --pkg bufferutil --ver 4.2.0` | the rendered action actually fetches, builds and tests under riscv64 emulation |
 | L2 | `python3 tests/l2_publish.py` | publish order A→B, idempotency, manifest merge, name identity, partial-failure re-entry (verdaccio) |
+| L2 | `python3 tests/verify_published.py bufferutil 4.2.0` | what the registry serves, compared file by file with upstream's own tarball (`--shape prebuild\|wrapper\|platform`) |
+| patches | `python3 scripts/check_patches.py [--network]` | `upstream/*.patch` are real, declared, repository-free diffs that still apply |
 | L3 | GitHub Actions in a fork | emulated qemu, artifact reuse, real registry publishing |
 
 L1 and L2 need docker. For L1, build the toolchain image once:
@@ -225,21 +227,113 @@ consumer tries it:
   @oxc-project:registry=https://registry.npmjs.org/
   replace-registry-host=never
   ```
+
+  Pointing the group repository at npm instead of mapping scopes is the simpler
+  arrangement: `npm i rolldown --registry=https://…/repository/npm-rv-test-group`
+  resolves our build first and every other package from its npmjs proxy, with no
+  `.npmrc` changes and no `replace-registry-host` trap.
+* a **globally** installed CLI is a separate copy. `npm i -g rolldown` fetches upstream
+  unless it is pointed at this registry, and upstream carries none of the riscv64
+  bindings, so the CLI on `PATH` keeps failing with "Cannot find native binding" even
+  while the project install is correct. Reinstall it from the registry - or run the
+  project copy with `npx rolldown` - and check what actually landed:
+
+  ```
+  npm i -g rolldown@1.3.3 --registry=https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-group
+  ls -l /usr/local/lib/node_modules/rolldown/dist/shared/*.node   # the riscv64 binding must be there
+  rolldown src/main.js --file bundle.js
+  ```
+
+  (A group repository with an npmjs proxy also makes `npm i -g` behave: the
+  alternative is mapping `@rolldown` and `@oxc-project` to npmjs and setting
+  `replace-registry-host=never`, as above.)
+
 * a version that also exists upstream looks identical to a proxying registry. Hosted
   members win in a group repository, so consumers get the riscv64 build - but a
   `latest` that upstream has already moved past resolves to the binding-less upstream
   package, and publishing the same version again is refused by the registry as
   "already exists" (the publish step logs that as a skip).
 
+### Non-riscv64 consumers
+
+A published package is the upstream code with our riscv64 artifact added, so it also
+installs and runs on other architectures - through upstream's own paths:
+
+| consumer | `rolldown` | `bufferutil` / `utf-8-validate` |
+| --- | --- | --- |
+| linux riscv64 | our platform package `@rolldown/binding-linux-riscv64-gnu`, installed through the wrapper's `optionalDependencies` | our prebuild (`prebuilds/linux-riscv64/`) |
+| linux x64 / arm64, macOS, Windows | upstream's optional binding package, resolved through the group repository's npmjs proxy | compiled from source by `node-gyp-build`, so a C/C++ toolchain is needed |
+
+No manifest restricts the platform (`os`/`cpu` are unset), so `npm install` on x64
+succeeds and our riscv64 artifact is simply unused there: the package is not
+riscv64-only, and x64 users do not silently get a wrong binary. Verified on an x64 host
+against the group repository - `npm i rolldown` plus a bundle runs on upstream's
+`@rolldown/binding-linux-x64-gnu`, and `npm i bufferutil utf-8-validate` compiles
+`build/Release/*.node` from source and runs. The hosted-only repository is not enough
+for either: it lacks the ordinary dependencies (`@oxc-project/types`,
+`node-gyp-build`, ...), so `npm i` fails with 404 before the platform question arises.
+
+If a package must refuse to install elsewhere, say so in the recipe - the renderer
+writes `os` and `cpu` into the published manifest:
+
+```yaml
+npm_publish:
+  - role: main
+    name: rolldown
+    dir: out/rolldown
+    os: linux
+    cpu: riscv64
+```
+
+npm then rejects those installs with `EBADPLATFORM` instead of falling back to upstream
+code, which is the honest signal when only our binary is meant to run.
+
 Pull requests only build and test; merging to `main` is the approval gate that also
 publishes. If publishing fails, the artifact is still there - the four build steps run
 before it.
 
+## Upstream increments
+
+Every recipe that adds riscv64 support also carries the same increment written as a
+pull request for upstream, under `upstream/`. Those patches are **not applied here** -
+the recipes publish upstream's own artifacts plus our riscv64 addition - and they exist
+so the work can be offered back instead of living only in this repository. Anyone can
+read them and send them upstream as they are:
+
+| recipe | increment | upstream files |
+| --- | --- | --- |
+| `bufferutil` 4.2.0 | `build a linux-riscv64 prebuild and ship it in the release tarballs` | `.github/workflows/ci.yml` |
+| `utf-8-validate` 6.0.6 | same increment for its own CI | `.github/workflows/ci.yml` |
+| `rolldown` 1.3.3 | `build and publish a riscv64 binding` | `packages/rolldown/package.json`, `.github/workflows/reusable-release-build.yml` |
+
+`packages/<pkg>/<version>/upstream/*.patch` starts with a header naming the upstream
+repository, the base ref and the files it touches, then a real unified diff generated
+against a checkout of that ref. `scripts/check_patches.py` keeps them honest and runs
+as part of `--check-all`:
+
+* the patch is a genuine diff - no `/dev/null` sides, no invented headers, `a/` and
+  `b/` prefixes intact;
+* every file it changes is declared in `.stat: upstream_increments[].touches`, and
+  nothing else is;
+* it mentions nothing of this repository (registry hosts, mirrors, container files),
+  because a patch that does cannot be submitted;
+* the platform package name matches what napi-rs derives from the target triple
+  (`-riscv64-gnu` for `riscv64gc-unknown-linux-gnu`), and the increment actually adds
+  that target;
+* with `--check-patches-network`, `git apply --check` against the pinned upstream ref,
+  so a patch no longer applies is caught before someone opens the pull request.
+
+The distinction matters and is enforced rather than documented: `patches/` holds
+build-time patches this repository applies to make a build work, `upstream/` holds
+increments for upstream. The generated `patch` step never touches `upstream/`, and a
+test asserts that.
+
 ## Layout
 
 ```
-packages/<pkg>/<version>/   recipes (.stat, commands/, patches/); <pkg> is the npm
-                            name as published upstream (unscoped when upstream is)
+packages/<pkg>/<version>/   recipes (.stat, commands/, patches/, upstream/, templates/,
+                            tests/); <pkg> is the npm name as published upstream
+                            (unscoped when upstream is)
 docker/                     riscv64 toolchain image
 scripts/                    renderer, change detector, recipe helpers
 .github/templates/          the composite action template

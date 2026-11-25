@@ -17,6 +17,12 @@ packages/
       patches/                # optional
         0001-*.patch
         .disable              # optional, see §4
+      upstream/               # optional: the same increment, written for upstream
+        riscv64-*.patch       # see §8 - never applied here
+      templates/              # optional: originals for files the publish step writes
+        package.json  README.md
+      tests/                  # optional: what the test step runs, if it needs files
+        riscv64-skip.txt  vitest.config.mjs  package.json
     common/                   # optional baseline layer, never built on its own
       commands/  patches/
 ```
@@ -65,7 +71,7 @@ artifacts:
   path: prebuilds/linux-riscv64/*.node    # glob, relative to the source root
 
 npm_publish:
-  - role: main           # main | binary
+  - role: main           # main | binary | binding
     # The name to publish under, i.e. what a consumer types. Keeping the upstream
     # name (and scope) makes `npm i <pkg>` transparent; a fork that must re-brand
     # says so here, or passes --publish-scope at render time.
@@ -75,7 +81,38 @@ npm_publish:
     registry: https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local
     token_env: NODE_AUTH_TOKEN   # env var holding the credential (see §6)
     auth: basic          # token | basic
-    generate_manifest: true
+    # Which package the published tarball starts from (see §6):
+    #   omitted / source-tree    - the built tree under `dir`
+    #   upstream-tarball         - upstream's published tarball plus our overlay
+    base:
+      kind: upstream-tarball
+      url: https://registry.npmjs.org/example/-/example-1.0.0.tgz
+      integrity: sha512-…      # required: the tarball is verified before it is used
+    overlay:                   # copied in, same relative paths as in the tarball
+      - prebuilds/linux-riscv64
+    allow_overwrite: false      # overlay may replace upstream files (deliberate)
+    # The manifest of the published package (see §6):
+    #   upstream  - take upstream's manifest, touch only what the recipe says
+    #   generated - create/update it from these fields
+    #   template  - render templates/package.json (placeholders substituted)
+    manifest_shape: upstream
+    manifest_template: templates/package.json
+    readme: templates/README.md
+    optional_dependencies:      # main only: platform packages it references
+      - "@scope/binding-linux-riscv64-gnu"
+    # platform fields, written for generated/template shapes and for role=binding
+    os: linux
+    cpu: riscv64
+    libc: glibc
+    main: example.node
+    engines:
+      node: ^20.19.0 || >=22.12.0
+
+# The increment offered back to upstream. Recorded, checked, never applied.
+upstream_increments:
+  - patch: upstream/riscv64-prebuild.patch
+    touches: [.github/workflows/ci.yml]       # must equal the files in the diff
+    pr: build a linux-riscv64 prebuild and ship it in the release tarballs
 ```
 
 Validation (the renderer refuses to build otherwise):
@@ -86,7 +123,15 @@ Validation (the renderer refuses to build otherwise):
 | `source.sha256` is mandatory when `source` is present | a mirror without a checksum is not reproducible |
 | `npm_publish[].version` must equal the recipe's version directory | one version directory describes exactly one release |
 | every `npm_publish` entry needs `name` and `dir` | publishing an unnamed or unrooted package is meaningless |
-| `role: binary` entries need `os` and `cpu` | that is what makes npm pick the right optional dependency |
+| `role: binary` / `role: binding` entries need `os` and `cpu` | that is what makes npm pick the right optional dependency |
+| `base` needs `url` ending in `<name>-<version>.tgz` and a `sha512` `integrity` | that tarball must be the release being republished, and it is verified before use |
+| `base`/`overlay` require `kind: upstream-tarball` | a source tree has nothing to overlay |
+| `overlay` paths must be relative and whitespace-free | they are copied, and a path with spaces is a shell trap |
+| `allow_overwrite` only applies to `upstream-tarball` | an overlay that replaces upstream files must be an explicit decision |
+| `manifest_shape: template` needs `manifest_template`, and it must name and version the package as the recipe does | a template that disagrees with `.stat` publishes something nobody declared |
+| `manifest_shape` and `generate_manifest` are exclusive | two spellings of one decision |
+| `optional_dependencies` belongs on `role: main` and must name platform packages of this recipe at this version | npm resolves those by name, so a typo downloads the wrong package or nothing |
+| `upstream_increments[].patch` must live under `upstream/` and declare `touches` and `pr` | see §11 - those files are pull requests, not build inputs |
 | a `requires` entry must name another `npm_publish` entry of the same recipe, at the same version | a renamed dependency must not be silently accepted |
 | `toolchain` must be `native` or `cross` | the action only knows how to run those two build models |
 | package directories must not be empty | an empty directory is a half-finished recipe, not a recipe |
@@ -145,55 +190,93 @@ fi
 
 ## 6. Generated `publish`
 
-Order: native (`role: binary`) packages first, then `main`, following `requires`
-so a dependency is always published before the package that references it.
+A recipe publishes one or more npm packages, in the order `.stat` lists them, with
+platform roles (`binary`, `binding`) first and then `main` following `requires` - a
+platform package is always published before the package that references it. The
+mapping of an npm release onto those packages is upstream's, not ours:
 
-For every entry:
+| upstream's release | packages a recipe publishes |
+| --- | --- |
+| one package that carries prebuilds for several platforms | the same package, with `prebuilds/linux-riscv64` added |
+| one JS package plus one platform package per target (napi-rs) | the same two, the platform one for riscv64 |
 
-1. if `dir != "."`, the artifact glob (`.stat: artifacts.path`) is copied into
-   `dir/` and the first copied file becomes `main` when the manifest has none;
-2. the manifest is handled according to the tier:
+So a published tarball is always **upstream's release plus the riscv64 increment**,
+never a rebuilt tree: an x64 consumer that installs from a mirror carrying these
+recipes gets exactly what npmjs.org would have served.
 
-   | tier | condition | behaviour |
-   | --- | --- | --- |
-   | custom | `commands/publish` exists | the renderer gets out of the way |
-   | generate | `generate_manifest: true` | create the manifest when it is missing, update it when it exists: `name` and `version` come from `.stat`, every other field is preserved |
-   | verify | `generate_manifest` absent/false | the manifest must exist and its `name`/`version` must match `.stat`; a mismatch is a hard failure |
+### 6.1 Where the tarball starts (`base.kind`)
 
-3. visibility: the publish runs with `--loglevel http` and its output is streamed
+* `source-tree` (default) - `dir/` in the build tree. Used when the build produced
+  the package that gets published (a generated manifest, a platform package, or a
+  wrapper that the fetch step staged from the upstream tarball).
+* `upstream-tarball` - upstream's published tarball, downloaded **inside the publish
+  step**, verified against `base.integrity`, unpacked, and then the `overlay` paths
+  are copied into it. `allow_overwrite: false` (the default) makes the copy refuse to
+  replace an existing file, so an overlay can only add. This is how a package whose
+  release artifacts are built in upstream's CI (bufferutil, utf-8-validate) is
+  republished without rebuilding the other platforms: the recipe never had them in
+  the first place, and a source tree cannot reproduce them.
+
+Downloading the base inside the publish step, rather than in `fetch`, is deliberate:
+the publish side never influences the build key (§9), so a recipe can switch its
+publish shape - or fix its integrity hash - without invalidating every cached build.
+
+### 6.2 The manifest (`manifest_shape`)
+
+| shape | behaviour |
+| --- | --- |
+| `upstream` | the manifest that came with the package is kept field for field; only `optionalDependencies` (merged, see below) and `publishConfig.registry` are written |
+| `generated` | created when missing, updated when present: `name`/`version` come from `.stat`, and `os`/`cpu`/`libc`/`main`/`engines` are written when declared |
+| `template` | `templates/package.json` with `{{name}} {{version}} {{registry}} {{os}} {{cpu}} {{libc}} {{main}}` substituted; a leftover placeholder is an error |
+
+`manifest_shape: upstream` is what makes a republished package indistinguishable from
+upstream's, and the recipes assert it after publishing (`tests/verify_published.py`,
+§10). `template` is for platform packages, whose manifests upstream generates with
+napi at release time: the template mirrors upstream's own platform manifest field for
+field (`files`, `engines`, `repository.directory`, `bugs`, `publishConfig.access`,
+`os`, `cpu`, `libc`), so the riscv64 package differs from the x64 one only where the
+architecture differs.
+
+`optionalDependencies` are merged additively and **idempotently**: every platform
+upstream lists survives, nothing but the packages this recipe publishes is added, and
+running the publish step twice produces the same manifest. "The count must grow" was
+wrong - a recipe that publishes out of its own build tree writes the entry into that
+manifest, so the second run would have refused a no-op.
+
+`publishConfig.registry` in the manifest is realigned to the recipe's registry: npm
+gives `publishConfig` precedence over `--registry`, so an upstream manifest pinning
+npmjs.org would send the tarball somewhere the recipe never asked for. With
+`upstream` the realignment is the only edit a republished package carries, and it is
+recorded in the log.
+
+### 6.3 Visibility, idempotency and credentials
+
+1. visibility: the publish runs with `--loglevel http` and its output is streamed
    (`| tee`) instead of captured, because a captured npm looks frozen in CI logs
    until it exits - a slow upload then reads as "publish hangs" with no evidence.
-   The streamed text is still classified in (4).
-4. idempotency: `npm publish` runs, and the registry answer decides. A "this
-   version already exists" refusal (409 / `EPUBLISHCONFLICT` / "cannot publish
-   over") is logged as a skip so a rerun stays green; anything else fails. A plain
+   The streamed text is still classified in (2).
+2. idempotency: `npm publish` runs, and the registry answer decides. A "this version
+   already exists" refusal (409 / `EPUBLISHCONFLICT` / "cannot publish over") is
+   logged as a skip so a rerun stays green; anything else fails. A plain
    `npm view <name>@<version>` lookup is deliberately not used: a registry that
    proxies or groups another one serves upstream versions of the same name, so the
    lookup reports our own package as published and the publish silently never
-   happens (witnessed with verdaccio and `bufferutil@4.2.0`);
-5. credentials: `token_env` names an environment variable; when it is set, a line
+   happens (witnessed with verdaccio and `bufferutil@4.2.0`).
+3. credentials: `token_env` names an environment variable; when it is set, a line
    keyed by the **full registry URL** (path included, npm looks credentials up by the
-   URL it talks to) is written to a throwaway `.npmrc`. The registry URL is normalized
-   to end with `/` first: npm computes the credential key with
+   URL it talks to) is written to a throwaway `.npmrc`. The registry URL is
+   normalized to end with `/` first: npm computes the credential key with
    `new URL(".", registryUrl)`, so a URL without the slash loses its last path
    segment (`.../repository/npm-local` → key `//host/repository/`) and the publish
    pre-flight refuses with `ENEEDAUTH` without sending a request:
    `//<host>/<path>/:_authToken=${TOKEN_ENV}` for `auth: token` (the default), or
    `//<host>/<path>/:_auth=${TOKEN_ENV}` for `auth: basic`, which is what a registry
    answering `WWW-Authenticate: Basic` expects (the value is base64 `user:password`).
-   before the idempotency probe (a private registry needs auth even to answer it);
-6. `npm publish <dir> --registry <registry> --access public --ignore-scripts`.
+4. `npm publish <absolute dir> --registry <registry> --access public --ignore-scripts`.
 
-`name` is identity: with `verify`, renaming a package is refused rather than
-published under a second name. With `generate_manifest: true`, a rename is a
-deliberate re-brand and is allowed.
-
-`publishConfig.registry` in the manifest is overridden to win over `--registry`:
-npm gives `publishConfig` precedence, so an upstream manifest that pins its own
-registry would send the tarball somewhere the recipe never asked for. In `generate`
-mode the renderer rewrites it to the recipe's registry (logged, `publishConfig.access`
-is kept); in `verify` mode a disagreement is a hard failure, because a manifest the
-renderer may not edit must not be silently published elsewhere.
+`name` is identity: publishing a package whose manifest is named differently is refused
+rather than published under a second name - a rename ships "another package", not an
+update, and the original name's consumers get no riscv64 support.
 
 Large packages need a registry that accepts them: verdaccio's default
 `max_body_size` is 10 MB, so an L2 rehearsal of a package carrying a native binding
@@ -216,6 +299,12 @@ Generated variables available in the template: `pkg.name`, `pkg.dirname`,
 `pkg.target`, `recipe.dir`, `src.dir`, `steps.dir`, `has.patches`, plus every
 scalar from `.stat` flattened with dots (`upstream.repo`, `upstream.subdir`,
 `npm_publish.0.registry`, …).
+
+The action also exports `RECIPE_DIR` (`/w/<recipe.dir>` inside the build container)
+to the steps. It is how recipe-local data reaches a step - `tests/riscv64-skip.txt`,
+`tests/vitest.config.mjs`, `templates/package.json` - so a test step never has to
+hard-code a path that only exists in this repository. Only the `test` step receives it
+today; the publish step reads what it needs on the runner.
 
 The toolchain adds its own variables, so a recipe never has to spell out where
 the steps run:
@@ -365,6 +454,8 @@ to a full build.
 | L0 | `python3 -m unittest discover -s tests` | renderer, layering, detection, generated YAML validity, golden snapshot (`tests/golden/`, refresh with `python3 tests/regen_golden.py`) |
 | L1 | `python3 tests/run_action_locally.py --pkg bufferutil --ver 4.2.0` | the rendered action really fetches, builds and tests under riscv64 emulation |
 | L2 | `python3 tests/l2_publish.py` | publish order, idempotency, manifest merge, identity, partial-failure re-entry against verdaccio |
+| L2 (delivered) | `python3 tests/verify_published.py <pkg> <ver> [--shape …]` | the bytes a registry serves compared with upstream's: file by file, manifest field by field |
+| patches | `python3 scripts/check_patches.py [--network]` | `upstream/*.patch` are real diffs, declared, free of this repository's traces, and still apply |
 
 L1 and L2 need docker. L1 uses the toolchain images: `--image` (or `RISCV_IMAGE`)
 is the build image and `--test-image` (or `RISCV_TEST_IMAGE`) the test image, so a
@@ -384,3 +475,47 @@ publishing at a local registry. L3 (real GitHub Actions) runs in a fork; there t
 registry and its credential are the ones the `.stat` names, and `--override` (or the
 `PUBLISH_REGISTRY` / `PUBLISH_SCOPE` variables) moves a build elsewhere without
 touching the recipes.
+
+## 11. Upstream increments
+
+A recipe that adds riscv64 support usually has two kinds of patch, and mixing them is
+how a "submit it upstream" promise quietly stops being true:
+
+| directory | what it is | applied by |
+| --- | --- | --- |
+| `patches/` | build-time patches: fixes this repository needs to make a build work | the generated `patch` step |
+| `upstream/` | the same increment written as a pull request for upstream | nobody here - it is offered as a PR |
+
+`upstream/<name>.patch` carries a short header, then a real unified diff generated
+against a checkout of the pinned ref:
+
+```
+Upstream-PR: build a linux-riscv64 prebuild and ship it in the release tarballs
+Upstream-Repo: https://github.com/websockets/bufferutil
+Upstream-Base: v4.2.0 (d8aa572)
+Upstream-Files: .github/workflows/ci.yml
+
+Why: …
+What: …
+How: …
+Note: …
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+```
+
+The patch is declared in `.stat: upstream_increments[]` with the files it touches and
+the PR description, and `scripts/check_patches.py` (run by `--check-all`, and
+`--check-patches` for the summary) enforces the boundary:
+
+* a genuine diff: no `/dev/null` sides (no file deletions or creations), `a/` and `b/`
+  prefixes intact, a real `diff --git` header per file;
+* `touches` and the diff's file list are equal in both directions;
+* nothing about this repository: no registry host, mirror, container file, `dsh`
+  path or `render.py` mention - a patch that mentions those cannot be submitted;
+* platform package names match the triple napi-rs derives (`riscv64gc-unknown-linux-gnu`
+  → `-riscv64-gnu`), and the increment actually adds that target;
+* `--check-patches-network` runs `git apply --check` against the pinned ref, so a
+  patch that no longer applies is caught before a pull request is opened.
+
+The generated `patch` step never mentions `upstream/`, and a test asserts that:
+build-time and upstream-facing patches cannot drift into each other.

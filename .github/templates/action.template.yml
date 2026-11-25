@@ -125,6 +125,10 @@ runs:
 
     # 4/5 - test: runs on the target CPU even for a cross recipe, and also asserts
     # the artifact really is a RISC-V object.
+    #
+    # RECIPE_DIR is the recipe inside the container, so a test step can read the
+    # recipe's own data files: the riscv64 skip list lives next to the recipe it
+    # belongs to (tests/riscv64-skip.txt), never in the test script.
     - name: test
       shell: bash
       run: |
@@ -134,7 +138,7 @@ runs:
           --user "${RISCV_DOCKER_USER:-$(id -u):$(id -g)}" \
           -e HOME=/w/.container-home -e npm_config_cache=/w/.container-home/.npm \
           -v "$GITHUB_WORKSPACE:/w" -w "/w/{{src.dir}}/{{upstream.subdir}}" \
-          -e SRC_DIR={{src.dir}} \
+          -e SRC_DIR={{src.dir}} -e RECIPE_DIR="/w/{{recipe.dir}}" \
           "$image" bash "/w/{{steps.dir}}/steps/test.sh"
 
     # 5/5 - publish: runs on the host, no emulation needed to move files and

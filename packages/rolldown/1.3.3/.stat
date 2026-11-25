@@ -1,18 +1,19 @@
 # Metadata for rolldown 1.3.3 (see docs/recipe-spec.md).
 #
-# rolldown ships one npm package that carries both a JavaScript wrapper and a
-# per-platform native binding. Upstream publishes no riscv64 binding: napi.targets
-# has no riscv64 entry, the 16 optionalDependencies name no riscv64 package, and
+# Upstream publishes two packages per release: the wrapper "rolldown" (JavaScript
+# glue in dist/, no binary) and one platform package per target,
+# "@rolldown/binding-<arch>-<abi>", which holds a single .node file. napi.targets
+# lists 16 targets and none of them is riscv64, and
 # @rolldown/binding-linux-riscv64-gnu exists on npm only as an empty 0.0.0
-# placeholder. The wrapper itself is ready for it, though - its loader already
-# probes for a binding inside the package before falling back to the separate
-# binding package:
+# placeholder. The wrapper's loader already has its riscv64 branch
+# (packages/rolldown/src/binding.cjs), so this recipe changes no source at all: it
+# builds the binding for riscv64, publishes it under the name upstream would have
+# used, and republishes the wrapper with one more optional dependency.
 #
-#   require('./rolldown-binding.linux-riscv64-gnu.node')   // dist/shared/
-#   require('@rolldown/binding-linux-riscv64-gnu')          // fallback
-#
-# so one package that carries our own binding under dist/shared/ works unchanged,
-# and no source patch is needed anywhere.
+# Binding first, then the wrapper: a consumer installs the wrapper and npm pulls the
+# platform package as an optional dependency, which is upstream's layout exactly.
+# That is also why the wrapper must not carry a .node file - the test step asserts
+# it, because a binding inside the wrapper would be published for every CPU.
 #
 # The published name stays "rolldown" on purpose: the package is the wrapper the
 # ecosystem depends on, and a consumer that resolves it from a registry carrying
@@ -30,20 +31,54 @@ upstream:
 toolchain: cross
 
 artifacts:
-  path: out/rolldown/dist/shared/*.node
+  path: out/binding/*.node
 
 npm_publish:
-  - role: main
-    name: rolldown
+  - role: binding
+    name: "@rolldown/binding-linux-riscv64-gnu"
     version: 1.3.3
-    dir: out/rolldown
+    dir: out/binding
+    os: linux
+    cpu: riscv64
+    libc: glibc
+    main: rolldown-binding.linux-riscv64-gnu.node
+    engines:
+      node: ^20.19.0 || >=22.12.0
+    # Upstream generates this manifest with napi before it publishes, so ours mirrors
+    # its shape field for field (templates/package.json). The test step packs the
+    # package and asserts it holds exactly manifest + README + binary, like upstream's
+    # own platform tarballs do.
+    manifest_shape: template
+    manifest_template: templates/package.json
+    readme: templates/README.md
     # Trailing slash matters: npm derives its credential key from the URL as a
     # directory (new URL('.', url)), so without it npm looks one segment up
-    # (//host/repository/) and the auth line below never matches.
+    # (//host/repository/) and the auth line never matches.
     registry: https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/
     token_env: NODE_AUTH_TOKEN
     # Basic credentials: base64 of "user:password" (see bufferutil for why).
     auth: basic
-    # The wrapper manifest comes from the pinned upstream tarball; the renderer
-    # rewrites name/version/publishConfig so the published package is ours.
-    generate_manifest: true
+
+  - role: main
+    name: rolldown
+    version: 1.3.3
+    dir: out/rolldown
+    registry: https://forgestash-old.verify.oepkgs.net/repository/npm-rv-test-local/
+    token_env: NODE_AUTH_TOKEN
+    auth: basic
+    # The wrapper manifest comes from the pinned upstream tarball; the publish step
+    # only adds the optional dependency below and points publishConfig.registry at
+    # the mirror, so upstream's 16 platform packages survive untouched.
+    manifest_shape: upstream
+    optional_dependencies:
+      - "@rolldown/binding-linux-riscv64-gnu"
+
+# Upstream's increment, written as a pull request: the target joins napi.targets and
+# the release workflow gains a native riscv64 build row. Recorded here, never applied
+# by this recipe.
+upstream_increments:
+  - patch: upstream/riscv64-target.patch
+    touches:
+      - packages/rolldown/package.json
+      - .github/workflows/reusable-release-build.yml
+    pr: build and publish a riscv64 binding
